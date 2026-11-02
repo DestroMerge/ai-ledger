@@ -36,7 +36,8 @@ person (the "owner") who makes the calls, with Claude doing the work.
 | `Docs/Ledger/README.md` | The manual: every command, rule and refusal |
 | `Docs/Ledger/epics/PR-E01.json` | An example epic: three tasks over two waves, a dependency, an open decision, a review subtask |
 | `Docs/Ledger/meta.json` | Waves, conventions, departments, where the audit starts |
-| `Docs/Ledger/ledger_web.py`, `web/` | A local web view (127.0.0.1 only): now, map, epics, tasks, decisions, commit activity |
+| `Docs/Ledger/ledger_web.py`, `web/` | A local web view (127.0.0.1 only): now, map, epics, tasks, decisions, commit activity. See "The ledger website" |
+| `Docs/Ledger/Ledger Web.bat`, `ledger_web.sh` | Double-click (Windows) or run (macOS, Linux) to start the web view and open it in your browser |
 | `Docs/Ledger/setup_ledger.py` | One-time setup: your id prefix, your name, git or Diversion |
 | `Docs/Ledger/add_epic.py` | Adds an epic with its first task |
 | `.claude/settings.json` | Registers the two session hooks |
@@ -57,6 +58,32 @@ person (the "owner") who makes the calls, with Claude doing the work.
    main session files a fix task for each one that holds up, or rejects it with a reason.
 5. `ledger.py check` is the gate: the ledger's rules, the rendered `LEDGER.md` up to date, and every commit since the
    audit started accounted for.
+
+## The ledger website
+
+![The ledger website's Now page for an example project: the wave sequence, one task in progress, one blocked on an open decision, and the tasks ready to start](Docs/images/ledger-web.png)
+
+*An example project (a small recipe-sharing app), not a real one.*
+
+A local page for reading the ledger at a glance and answering decisions without opening a terminal.
+
+- **Start it:** on Windows, double-click `Docs/Ledger/Ledger Web.bat`. On macOS or Linux, run
+  `Docs/Ledger/ledger_web.sh`. Either one starts the server and opens http://127.0.0.1:8717 in your browser. Keep
+  the window open while you use the page; closing it stops the server. If the server is already running, the `.bat`
+  just opens the page.
+- **Options:** `python Docs/Ledger/ledger_web.py --port 8800 --no-browser` picks another port and skips opening a
+  tab, for example when you run two projects' ledgers at once.
+- **What it shows:** *Now* (the current wave, what's in progress, blocked and ready), *Map* (every wave and its
+  tasks), *Epics*, *Tasks*, *Decisions*, *Activity* (the commit log, each commit matched to its task) and *Rules*
+  (any rule the ledger breaks, or "Rules pass").
+- **Answering decisions:** each open decision shows its options with a button apiece. Your click goes to an inbox
+  file, not the ledger; the next session's `ledger.py next` sees it and `ledger.py apply` makes it the ruling.
+- **It follows the work:** the page reloads itself when a ledger file changes, so you can leave it open beside a
+  running session.
+- **It never changes the ledger.** It reads it through `ledger.py`, so "ready" and "current wave" are the tool's own
+  answers. It listens on 127.0.0.1 only, so nothing outside your machine can reach it.
+
+If `python` on your PATH is the Microsoft Store stub, put the full path to your Python in the `.bat`.
 
 You can run several sessions at once: the ledger is one file per epic, saves only write what changed, and a save over
 a file another session changed is refused rather than merged.
