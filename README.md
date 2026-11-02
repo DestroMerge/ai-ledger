@@ -1,4 +1,4 @@
-# claude-code-ledger
+# ai-ledger
 
 A task ledger for working with Claude Code across many sessions. The plan lives in version control as JSON, one
 Python tool is the only thing allowed to change it, and every commit has to name the task it belongs to. A few
