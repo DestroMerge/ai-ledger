@@ -1,0 +1,57 @@
+{
+  "schema": "ledger",
+  "schemaVersion": 2,
+  "title": "Project Ledger",
+  "summary": "The task ledger for this project. Epic PR-E01 is an example to read and then replace with your own.",
+  "date": "2026-11-01",
+  "auditFrom": "git:000000000000",
+  "owner": {
+    "name": "Sam"
+  },
+  "waves": {
+    "1": "Foundations: the first working slice and the decisions it needs",
+    "2": "Review and hardening of wave 1"
+  },
+  "outsideCommits": [],
+  "gates": {
+    "ledger": "python Docs/Ledger/ledger.py check. Run python Docs/Ledger/ledger.py selftest as well whenever ledger.py changes."
+  },
+  "conventions": {
+    "ids": "PR-Enn is an epic, PR-Enn.mm a task, PR-Dnn a decision. Stable; never renumbered or reused.",
+    "wave": "The execution order. `next` shows the lowest wave with unfinished work. A task filed during later work takes the wave its work belongs to, not the wave being worked when it was filed.",
+    "files": "The files a task may edit. An entry ending in / allows everything under it. A commit naming the task that touches anything else is refused, unless it is given --reason: then the paths are added to the task's files and recorded in its filesAdded with the reason and the date.",
+    "acceptance": "check: what to run or read. expect: what passing shows. Every check must be able to fail.",
+    "status": "planned | in-progress | blocked | done | withdrawn. A status is a claim; read the tree.",
+    "evidence": "Required for done. Label it ran-it, read-in-the-code or read-in-a-document, and say what was observed, not what was concluded.",
+    "landed": "The commit that closed a done task, stamped by ledger.py commit.",
+    "decisions": "The owner's calls. A task that depends on an open decision cannot start. `next` asks one at a time. An open decision carries options (2 to 4, each a label and a detail, one recommended) so the owner can answer it on the ledger website; the answer waits in Saved/Ledger/answers.json until a session runs `apply`, and `next` prints waiting answers first.",
+    "commits": "Ledger work commits only through python Docs/Ledger/ledger.py commit. Its subject starts with a task or epic id, or it names a role (Owner, Repair, Checkpoint, Ledger) and a reason.",
+    "outsideCommits": "A commit made outside the tool that touched an in-progress task's files is RECORDED here with a reason, never excused by moving auditFrom.",
+    "auditFrom": "Move only to a commit inside the window, after a green audit at the old mark, and say so in the commit.",
+    "ledgerFiles": "The ledger is Docs/Ledger/meta.json plus one Docs/Ledger/epics/PR-Enn.json per epic, holding the epic, its tasks and the decisions filed under it. Change it through ledger.py (start, done, block, note, add-task, add-decision, decide, apply), which writes only the files that changed and refuses to overwrite a file another session changed after it read it. See Docs/Ledger/README.md.",
+    "owner": "One name from meta.json 'departments', or the project owner. A task owned by a department other than the hub is a department subtask and carries 'kind'. The owner's part of another owner's task is its needs<Owner> field, in words.",
+    "kind": "review, measure or produce: a department subtask. The hub dispatches it (ledger.py dispatch prints the department agent's prompt); the agent starts it with --by, records findings and hands it in with submit; only the hub's confirm, by a different --by, marks it done.",
+    "findings": "Recorded on the subtask by the agent; the hub routes every finding to a task, or rejects it with a reason, before it confirms. blocker: data loss, corruption, a security hole or a crash on the priority path; its fixing task goes on the critical path now. hardening: everything else; its fixing task goes in the wave its work belongs to. Every finding points at something checkable (a repo path with :line, a log, a commit id)."
+  },
+  "departments": [
+    {
+      "name": "Engineering",
+      "hub": true,
+      "agent": null,
+      "editor": "none",
+      "does": "The hub: the main Claude Code session. Builds, files tasks and decisions, starts the department agents, confirms their work and routes their findings."
+    },
+    {
+      "name": "Code Review Department",
+      "agent": "code-review-department",
+      "editor": "none",
+      "does": "Reads landed code for correctness bugs, data loss, security holes and broken contracts (review)."
+    },
+    {
+      "name": "Game Design Department",
+      "agent": "game-design-department",
+      "editor": "none",
+      "does": "Example for a game project: reviews designs, plans and tuning for the loop, challenge, progression and fun (review)."
+    }
+  ]
+}

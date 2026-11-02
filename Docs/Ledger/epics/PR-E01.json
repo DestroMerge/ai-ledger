@@ -1,0 +1,72 @@
+{
+  "epic": {
+    "id": "PR-E01",
+    "title": "Example: sign-in for a small web app",
+    "status": "planned",
+    "plan": "Docs/Ledger/README.md",
+    "goal": "An example epic to show the shape of the ledger: tasks in waves, a dependency, an open decision with options, and a review subtask for a department agent. Read it, then withdraw or replace it."
+  },
+  "tasks": [
+    {
+      "id": "PR-E01.01",
+      "epic": "PR-E01",
+      "title": "Add a sign-in endpoint with hashed passwords",
+      "owner": "Engineering",
+      "size": "M",
+      "wave": 1,
+      "files": ["src/auth/", "tests/test_auth.py"],
+      "acceptance": {
+        "check": "Run the test suite (tests/test_auth.py).",
+        "expect": "A correct password signs in, a wrong one is refused with 401, and the stored hash never equals the password. Changing the hash check to always pass makes a test fail."
+      },
+      "status": "planned"
+    },
+    {
+      "id": "PR-E01.02",
+      "epic": "PR-E01",
+      "title": "Send password-reset emails",
+      "owner": "Engineering",
+      "size": "S",
+      "wave": 1,
+      "files": ["src/auth/reset.py", "src/email/", "tests/test_reset.py"],
+      "dependsOn": ["PR-E01.01", "PR-D01"],
+      "acceptance": {
+        "check": "Run tests/test_reset.py against the email provider's test mode.",
+        "expect": "A reset request for a known address sends one email with a single-use link; an unknown address sends nothing and gets the same response."
+      },
+      "status": "planned",
+      "needsSam": "Creates the email provider account once PR-D01 is ruled."
+    },
+    {
+      "id": "PR-E01.03",
+      "epic": "PR-E01",
+      "title": "Code review of the sign-in epic",
+      "owner": "Code Review Department",
+      "kind": "review",
+      "parent": "PR-E01",
+      "size": "S",
+      "wave": 2,
+      "files": [],
+      "acceptance": {
+        "check": "Read the covered tasks' files at their landed commits for correctness, data loss and security.",
+        "expect": "The evidence names every covered file with a verdict, clean or finding N (a clean resting on a guard names it); each problem found is a finding with a pointer."
+      },
+      "status": "planned"
+    }
+  ],
+  "decisions": [
+    {
+      "id": "PR-D01",
+      "epic": "PR-E01",
+      "question": "Which email provider sends the password-reset emails?",
+      "recommendation": "A transactional email service with a free tier and a test mode, so reset emails can be tested without sending real mail.",
+      "status": "open",
+      "source": "Example decision, filed with the example epic",
+      "options": [
+        {"label": "Transactional service", "detail": "A hosted email API with a test mode. Small monthly cost past the free tier.", "recommended": true},
+        {"label": "Our own SMTP server", "detail": "No vendor, but deliverability and spam filtering are on us."},
+        {"label": "No email for now", "detail": "Resets go through support by hand until there are users who need it."}
+      ]
+    }
+  ]
+}

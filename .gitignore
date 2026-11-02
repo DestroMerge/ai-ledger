@@ -1,0 +1,5 @@
+# The ledger's working files: the lock, the website's answers inbox, the commit cache, review dumps
+Saved/
+__pycache__/
+*.pyc
+.claude/settings.local.json

@@ -1,0 +1,7 @@
+{
+  "_about": "The four settings that tie the ledger tool to one project. Docs/Ledger/README.md, \"Configuration\", says what each one does. setup_ledger.py writes this file.",
+  "idPrefix": "PR",
+  "owner": "Sam",
+  "vcs": "git",
+  "unreal": false
+}
