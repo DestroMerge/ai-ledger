@@ -1,7 +1,7 @@
 {
   "id": "aa77013b-18f1-4679-9678-6d455d3536c5",
   "revision": 0,
-  "last_node_id": 324,
+  "last_node_id": 323,
   "last_link_id": 1296,
   "nodes": [
     {
@@ -3327,30 +3327,6 @@
         "width": 1024,
         "height": 1024
       }
-    },
-    {
-      "id": 324,
-      "type": "MarkdownNote",
-      "pos": [
-        2330,
-        -450
-      ],
-      "size": [
-        520,
-        330
-      ],
-      "flags": {},
-      "order": 66,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "Note: Bedrock settings",
-      "properties": {},
-      "widgets_values": [
-        "**Bedrock's settings** (2026-11-03 PT): what `Tools/local_3d.py` runs by default.\n\nChanged from the saved `trellis2_image_to_model` workflow:\n\n- Model switch on **TRELLIS.2** (false = Pixal3D).\n- DecimateMesh **400,000** triangles, not 18,000: at 18,000 the shape collapsed into a blob.\n- Normal map bake **muted and unhooked** from ApplyTextureToMesh: it made the body look faceted.\n\nPut the concept image in Load Image. For small items seen from far away the script can drop the upsample stage to 1024; keep 1536 for hero pieces."
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
     }
   ],
   "links": [
