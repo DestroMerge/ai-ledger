@@ -117,7 +117,7 @@ from pathlib import Path
 
 # Which copy of the tool this is. Projects copy the tool from the ai-ledger repository (update_ledger.py), so a copy
 # that has fallen behind shows here and in `check`. Raise it with every change to the tool files.
-VERSION = "2026.11.09"
+VERSION = "2026.11.09.2"
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -2549,8 +2549,48 @@ def persist(ledger: dict) -> str:
 # --------------------------------------------------------------------------- commit rules (pure)
 
 def subject_id(subject: str) -> str | None:
+    """The first task or epic id a commit subject starts with, or None."""
     m = RE_SUBJECT_ID.match(subject.strip())
     return m.group(1) if m else None
+
+
+def subject_ids(subject: str) -> list[str]:
+    """Every task or epic id at the start of a subject, in order: 'PR-E01.02 PR-E01.03: ...', 'PR-E01.02, PR-E01.03
+    ...' and 'PR-E01.02 and PR-E01.03 ...' all name both. A commit that did several tasks' work named them all and the
+    tool read only the first, so the others were never stamped landed (16 of 39 such tasks in one ledger)."""
+    out: list[str] = []
+    rest = subject.strip()
+    while True:
+        m = RE_SUBJECT_ID.match(rest)
+        if not m:
+            break
+        out.append(m.group(1))
+        rest = rest[m.end():]
+        rest = rest[re.match(r"\s*(?:,|&|\+|and\b)?\s*", rest).end():]
+    return list(dict.fromkeys(out))
+
+
+def named_files(ledger: dict, ids: list[str], ever: bool = False) -> list[str]:
+    """The files a commit naming these ids may carry: each named task's list, and for an epic id every list in it.
+    ever=True takes every list a task has held (files_ever), as the audit does."""
+    epics, tasks, _ = index(ledger)
+    lists = files_ever if ever else (lambda t: t.get("files") or [])
+    out: list[str] = []
+    for i in ids:
+        if i in tasks:
+            out += lists(tasks[i])
+        elif i in epics:
+            out += [f for t in ledger["tasks"] if t["epic"] == i for f in lists(t)]
+    return out
+
+
+def unlanded_in(ledger: dict, paths: list[str], named: list[str]) -> list[str]:
+    """The done tasks with no landed commit, in the epic files among these paths, that the commit does not name. A
+    task's `done` committed in another commit (a "Ledger: ... done" role commit, or the next task's commit, which
+    carries the same epic file) was never stamped landed: 39 tasks in one ledger."""
+    epics = {m.group(1) for m in (RE_EPIC_FILE.match(norm(p)) for p in paths) if m}
+    return [t["id"] for t in ledger["tasks"] if t["epic"] in epics and t["status"] == "done" and not t.get("landed")
+            and t["id"] not in named]
 
 
 def role_lines(message: str) -> list[str]:
@@ -2582,7 +2622,8 @@ def check_commit(ledger: dict, message: str, role: str | None, reason: str | Non
     errs: list[str] = []
     epics, tasks, _ = index(ledger)
     subject = message.strip().splitlines()[0] if message.strip() else ""
-    ident = subject_id(subject)
+    ids = subject_ids(subject)
+    ident = ids[0] if ids else None
     paths = [norm(p) for p in paths]
     if not paths:
         errs.append("no paths given; paths are explicit and there is no -a")
@@ -2602,36 +2643,45 @@ def check_commit(ledger: dict, message: str, role: str | None, reason: str | Non
         errs.append(f"subject names no task ({PREFIX}-Enn.mm) or epic ({PREFIX}-Enn), and no --role was given")
         return errs
 
-    if ident and RE_TASK.match(ident):
-        t = tasks.get(ident)
-        if not t:
-            errs.append(f"{ident}: no such task")
-            return errs
-        if t["status"] == "planned":
-            errs.append(f"{ident}: task is still planned; run `start {ident}` first")
-        if t["status"] == "done" and t.get("landed") and role != "Repair":
-            errs.append(f"{ident}: already done and landed at {t['landed']}; new work on it is --role Repair")
-        if t["status"] == "done" and not t.get("landed") and epic_rel(t["epic"]) not in paths:
-            errs.append(f"{ident}: closing a task commits {epic_rel(t['epic'])} with it")
-        if not role:
-            outside = files_outside(t, paths)
-            if outside:
-                errs.append(f"{ident}: paths outside the task's files list: {outside}. If they are this task's work, "
-                            f"commit again with --reason \"<why they belong to it>\" ({REASON_MIN}+ characters) and they "
-                            f"are added to its files list")
-    elif ident and RE_EPIC.match(ident):
-        if ident not in epics:
-            errs.append(f"{ident}: no such epic")
-            return errs
-        if epic_rel(ident) not in paths:
-            errs.append(f"{ident}: an epic-level commit changes the ledger, so {epic_rel(ident)} is among the paths")
-        if not role:
-            allowed = [f for t in ledger["tasks"] if t["epic"] == ident for f in t["files"]]
-            outside = [p for p in paths if not is_ledger_file(p) and not path_allowed(p, allowed)]
-            if outside:
-                errs.append(f"{ident}: paths outside every file list in the epic: {outside}")
+    # Several ids may lead the subject; each named task is checked, and the paths may be in any of their lists.
+    for i in ids:
+        if RE_TASK.match(i):
+            t = tasks.get(i)
+            if not t:
+                errs.append(f"{i}: no such task")
+                continue
+            if t["status"] == "planned":
+                errs.append(f"{i}: task is still planned; run `start {i}` first")
+            if t["status"] == "done" and t.get("landed") and role != "Repair":
+                errs.append(f"{i}: already done and landed at {t['landed']}; new work on it is --role Repair")
+            if t["status"] == "done" and not t.get("landed") and epic_rel(t["epic"]) not in paths:
+                errs.append(f"{i}: closing a task commits {epic_rel(t['epic'])} with it")
+        elif i not in epics:
+            errs.append(f"{i}: no such epic")
+        elif epic_rel(i) not in paths:
+            errs.append(f"{i}: an epic-level commit changes the ledger, so {epic_rel(i)} is among the paths")
+    if errs and any("no such" in e for e in errs):
+        return errs
+    if ids and not role:
+        outside = [p for p in paths if not is_ledger_file(p) and not path_allowed(p, named_files(ledger, ids))]
+        if outside and RE_TASK.match(ident):
+            errs.append(f"{ident}: paths outside the task's files list: {outside}. If they are this task's work, "
+                        f"commit again with --reason \"<why they belong to it>\" ({REASON_MIN}+ characters) and they "
+                        f"are added to its files list")
+        elif outside:
+            errs.append(f"{ident}: paths outside every file list in the epic: {outside}")
 
     if any(is_ledger_data(p) for p in paths):
+        # A task is closed by the commit whose subject names it: that is where landed is stamped. A `done` that rides
+        # in any other commit leaves the task done with no landed commit, which the audit then refuses for good.
+        loose = unlanded_in(ledger, paths, ids)
+        if loose:
+            errs.append(f"{', '.join(loose)} {'is' if len(loose) == 1 else 'are'} done with no landed commit, and this "
+                        f"commit carries {'its' if len(loose) == 1 else 'their'} epic file without naming "
+                        f"{'it' if len(loose) == 1 else 'them'}. Close {'it' if len(loose) == 1 else 'them'} with this "
+                        f"commit by starting the subject with the id{'s' if len(loose) > 1 else ''} too (several may "
+                        f"lead it: '{' '.join(loose[:3])}{' ...' if len(loose) > 3 else ''}: ...'), and the tool stamps "
+                        f"landed")
         errs.extend(validate(ledger))
         errs.extend(render_check(ledger))
     return errs
@@ -2648,7 +2698,8 @@ def judge_commits(ledger: dict, commits: list[dict]) -> tuple[list[str], list[st
     recorded = {o["id"]: o for o in ledger.get("outsideCommits", [])}
     active_files = [f for t in ledger["tasks"] if t["status"] == "in-progress" for f in t["files"]]
     for c in commits:
-        ident = subject_id(c["subject"])
+        ids = subject_ids(c["subject"])
+        ident = ids[0] if ids else None
         roles = role_lines(c.get("message", ""))
         bad_roles = [r for r in roles if r not in ROLES]
         if bad_roles:
@@ -2660,27 +2711,29 @@ def judge_commits(ledger: dict, commits: list[dict]) -> tuple[list[str], list[st
                         f"role commit made through ledger.py always has one")
         if ident:
             in_scope.append(c["id"])
-            if RE_TASK.match(ident):
-                t = tasks.get(ident)
-                if not t:
-                    errs.append(f"{c['id']}: names unknown task {ident}")
-                elif t["status"] == "planned":
-                    errs.append(f"{c['id']}: names {ident}, which is still planned")
-                elif not roles:
-                    # A commit made with the version control directly, naming a task, carried any file it liked.
-                    outside = [p for p in c.get("paths", []) if not is_ledger_file(p)
-                               and not audit_allowed(p, files_ever(t))]
-                    if outside:
-                        errs.append(f"{c['id']}: names {ident} but changed paths outside its files list: "
-                                    f"{outside[:5]}" + (f" and {len(outside) - 5} more" if len(outside) > 5 else ""))
-            elif ident not in epics:
-                errs.append(f"{c['id']}: names unknown epic {ident}")
-            elif not roles:
-                allowed = [f for t in ledger["tasks"] if t["epic"] == ident for f in files_ever(t)]
-                outside = [p for p in c.get("paths", []) if not is_ledger_file(p) and not audit_allowed(p, allowed)]
+            known = True
+            for i in ids:
+                if RE_TASK.match(i):
+                    t = tasks.get(i)
+                    if not t:
+                        errs.append(f"{c['id']}: names unknown task {i}")
+                        known = False
+                    elif t["status"] == "planned":
+                        errs.append(f"{c['id']}: names {i}, which is still planned")
+                        known = False
+                elif i not in epics:
+                    errs.append(f"{c['id']}: names unknown epic {i}")
+                    known = False
+            if known and not roles:
+                # A commit made with the version control directly, naming a task, carried any file it liked.
+                outside = [p for p in c.get("paths", []) if not is_ledger_file(p)
+                           and not audit_allowed(p, named_files(ledger, ids, ever=True))]
                 if outside:
-                    errs.append(f"{c['id']}: names epic {ident} but changed paths outside every file list in it: "
-                                f"{outside[:5]}" + (f" and {len(outside) - 5} more" if len(outside) > 5 else ""))
+                    where = ("outside every file list in it" if not RE_TASK.match(ident) else
+                             "outside its files list" if len(ids) == 1 else "outside their files lists")
+                    errs.append(f"{c['id']}: names {'epic ' if not RE_TASK.match(ident) else ''}{', '.join(ids)} but "
+                                f"changed paths {where}: {outside[:5]}"
+                                + (f" and {len(outside) - 5} more" if len(outside) > 5 else ""))
             continue
         if roles and not bad_roles:
             in_scope.append(c["id"])
@@ -2707,7 +2760,7 @@ def judge_commits(ledger: dict, commits: list[dict]) -> tuple[list[str], list[st
                 errs.append(f"{t['id']}: landed {t['landed']} is not in the {VCS.cmd} log window")
             else:
                 c = next(c for c in commits if c["id"] == t["landed"])
-                if subject_id(c["subject"]) != t["id"]:
+                if t["id"] not in subject_ids(c["subject"]):
                     errs.append(f"{t['id']}: landed {t['landed']} does not name the task in its subject")
     for o in ledger.get("outsideCommits", []):
         if commit_num(o["id"]) > commit_num(ledger["auditFrom"]) and o["id"] not in ids_in_window:
@@ -2829,18 +2882,17 @@ def commit_plan(ledger: dict, message: str, role: str | None, paths: list[str],
     paths = [norm(p) for p in paths]
     notes: list[str] = []
     epics, tasks, _ = index(ledger)
-    ident = subject_id(message.strip().splitlines()[0]) if message.strip() else None
-    epic = (tasks[ident]["epic"] if ident and RE_TASK.match(ident) and ident in tasks
-            else ident if ident and RE_EPIC.match(ident) and ident in epics else None)
+    ids = subject_ids(message.strip().splitlines()[0]) if message.strip() else []
+    named_epics = list(dict.fromkeys(tasks[i]["epic"] if i in tasks else i for i in ids if i in tasks or i in epics))
     if LEDGER_REL in paths and ledger_changes.get(LEDGER_REL) != "D":
         paths = [p for p in paths if p != LEDGER_REL]
-        stand_in = ([epic_rel(epic)] if epic else
+        stand_in = ([epic_rel(e) for e in named_epics] if named_epics else
                     sorted(p for p in ledger_changes if is_ledger_data(p) and p != LEDGER_REL))
         paths += [p for p in stand_in if p not in paths]
         notes.append(f"{LEDGER_REL} is split into meta.json and epics/; committing "
                      f"{', '.join(stand_in) or 'no ledger file'} in its place")
-    if epic:
-        paths += [p for p in (epic_rel(epic), LEDGER_MD_REL) if p not in paths]
+    if named_epics:
+        paths += [p for p in [epic_rel(e) for e in named_epics] + [LEDGER_MD_REL] if p not in paths]
     return paths, notes
 
 
@@ -2855,12 +2907,14 @@ def do_commit(ledger: dict, message: str, role: str | None, reason: str | None, 
     paths, notes = commit_plan(ledger, message, role, paths, changed_paths("Docs/Ledger"))
     for n in notes:
         print(f"note: {n}")
-    ident = subject_id(message.strip().splitlines()[0]) if message.strip() else None
+    ids = subject_ids(message.strip().splitlines()[0]) if message.strip() else []
+    ident = ids[0] if ids else None
     added: list[str] = []
     task = index(ledger)[1].get(ident) if ident and RE_TASK.match(ident) else None
-    if task and not role and reason and files_outside(task, paths):
-        # A file the task needs is added to its list with a written reason, not refused.
-        added = files_outside(task, paths)
+    outside = [p for p in paths if not is_ledger_file(p) and not path_allowed(p, named_files(ledger, ids))]
+    if task and not role and reason and outside:
+        # A file the task needs is added to its list (the first named task's) with a written reason, not refused.
+        added = outside
         if dry_run:
             print(f"dry run: would add to {ident}'s files: {added} (reason: {reason.strip()})")
             paths_checked = [p for p in paths if p not in added]
@@ -2898,21 +2952,24 @@ def do_commit(ledger: dict, message: str, role: str | None, reason: str | None, 
         return 1
     print(f"committed {cid}")
     print(VCS.show(cid))
-    if ident and RE_TASK.match(ident):
-        ledger2 = load()
-        t = index(ledger2)[1].get(ident)
-        if t and t["status"] == "done" and not t.get("landed"):
-            t["landed"] = cid
-            save(ledger2)
-            write_render(ledger2)
-            stamp = f"{ident} ledger: landed {cid}"
-            if agent:
-                stamp += f"\n\nCo-Authored-By: {agent} <noreply@anthropic.com>"
-            cid2, _ = VCS.commit([epic_rel(t["epic"]), LEDGER_MD_REL], stamp)
-            print(f"stamped landed={cid} on {ident}; ledger committed as "
-                  f"{cid2 or f'(id not found in {VCS.cmd} output)'}")
-            if cid2:
-                print(VCS.show(cid2))
+    # Every task the subject names that is now done and not landed is closed by this commit.
+    ledger2 = load()
+    tasks2 = index(ledger2)[1]
+    closing = [i for i in ids if i in tasks2 and tasks2[i]["status"] == "done" and not tasks2[i].get("landed")]
+    if closing:
+        for i in closing:
+            tasks2[i]["landed"] = cid
+        save(ledger2)
+        write_render(ledger2)
+        stamp = f"{' '.join(closing)} ledger: landed {cid}"
+        if agent:
+            stamp += f"\n\nCo-Authored-By: {agent} <noreply@anthropic.com>"
+        files = list(dict.fromkeys(epic_rel(tasks2[i]["epic"]) for i in closing)) + [LEDGER_MD_REL]
+        cid2, _ = VCS.commit(files, stamp)
+        print(f"stamped landed={cid} on {', '.join(closing)}; ledger committed as "
+              f"{cid2 or f'(id not found in {VCS.cmd} output)'}")
+        if cid2:
+            print(VCS.show(cid2))
     return 0
 
 
@@ -3950,6 +4007,40 @@ def _selftest_review_fixes(expect) -> None:
     c = [{"id": "dv.commit.13", "subject": "Checkpoint", "message": "Checkpoint\n\nRole: Checkpoint", "paths": ["X/Y.cpp"]}]
     expect("a Role line with no Reason line, typed into a commit made outside the tool", judge_commits(_fixture(), c)[0],
            True, "no 'Reason:' line")
+
+    print("several tasks in one commit, and closing a task:")
+    ok = (subject_ids("PR-E01.01 PR-E01.02: x") == ["PR-E01.01", "PR-E01.02"]
+          and subject_ids("PR-E01.01, PR-E01.02 and PR-E01.03 done") == ["PR-E01.01", "PR-E01.02", "PR-E01.03"]
+          and subject_ids("PR-E01.01 work on PR-E01.02") == ["PR-E01.01"] and subject_ids("PR-E01.011 x") == []
+          and subject_ids("Ledger: close PR-E01.01") == [] and subject_ids("PR-E01 PR-E01.02 x") == ["PR-E01", "PR-E01.02"])
+    expect("a subject's leading ids are read, however they are joined (control)", [] if ok else ["misread"], False)
+    f = _fixture(); index(f)[1]["PR-E01.02"]["status"] = "in-progress"; index(f)[1]["PR-E01.01"]["status"] = "done"
+    index(f)[1]["PR-E01.01"]["evidence"] = "ran-it: x"
+    expect("a commit naming two tasks may carry files from both lists (control)",
+           [e for e in check_commit(f, "PR-E01.02 PR-E01.01: both", None, None, ["Source/B.cpp", "Source/A.cpp",
+                                                                                    epic_rel("PR-E01")])
+            if "LEDGER.md" not in e], False)
+    expect("a commit naming two tasks, one still planned",
+           check_commit(_fixture(), "PR-E01.01 PR-E01.02: both", None, None, ["Source/A.cpp"]), True, "still planned")
+    f = _fixture(); index(f)[1]["PR-E01.01"].update(status="done", evidence="ran-it: x")
+    expect("a role commit carrying the epic file of a task done with no landed commit",
+           [e for e in check_commit(f, "Ledger: PR-E01.01 done", "Ledger", "the task passed its check", [epic_rel("PR-E01")])
+            if "LEDGER.md" not in e], True, "done with no landed commit")
+    f["tasks"].append(dict(task("PR-E01.04", "d", 1), status="in-progress", files=["Source/D.cpp"]))
+    expect("another task's commit carrying the same epic file",
+           [e for e in check_commit(f, "PR-E01.04 work", None, None, ["Source/D.cpp", epic_rel("PR-E01")])
+            if "LEDGER.md" not in e], True, "PR-E01.01 is done with no landed commit")
+    expect("the same commit naming both closes it (control)",
+           [e for e in check_commit(f, "PR-E01.04 PR-E01.01: work and close", None, None,
+                                    ["Source/D.cpp", epic_rel("PR-E01")]) if "LEDGER.md" not in e], False)
+    plan, _ = commit_plan(f, "PR-E01.04 PR-E02.01: x", None, ["Source/D.cpp"], {})
+    expect("a commit naming tasks in two epics carries the files it names (control)",
+           [] if plan == ["Source/D.cpp", epic_rel("PR-E01"), LEDGER_MD_REL] else [f"plan={plan}"], False)
+    g = _fixture(); g["tasks"][0].update(status="done", evidence="ran-it: x", landed="dv.commit.13")
+    c = [{"id": "dv.commit.13", "subject": "PR-E01.02 PR-E01.01: both", "message": "PR-E01.02 PR-E01.01: both",
+          "paths": ["Source/A.cpp"]}]
+    g["tasks"][1]["status"] = "in-progress"
+    expect("the audit takes a landed commit that names the task second (control)", judge_commits(g, c)[0], False)
 
     print("decisions: a ruling changes only with --supersede:")
     f = _decided(_fixture())

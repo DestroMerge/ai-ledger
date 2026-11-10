@@ -215,6 +215,12 @@ role (`--role Owner|Repair|Checkpoint|Ledger --reason "..."`).
 - The role comes from `--role` only. A `Role:` line typed into the message file is refused: the tool writes the
   `Role:` and `Reason:` lines itself, and the audit refuses a commit whose Role line has no Reason line.
 - A message file may start with a byte order mark (Windows PowerShell 5.1 writes one); it is dropped.
+- Several tasks may lead the subject (`PR-E02.01 PR-E02.02: ...`, or joined with `,` or `and`): the paths may be in
+  any of their lists, and every one that is done is stamped landed.
+- **A task is closed by the commit whose subject names it**; that is where `landed` is stamped. A commit that carries
+  an epic file holding a done task with no landed commit, without naming it, is refused: a `done` that rode in a
+  "Ledger: ... done" role commit or in the next task's commit used to leave the task unlanded for good. After `done`,
+  commit with the task's id leading the subject - the epic file alone is enough if the work is already committed.
 - The tool adds the named task's epic file and `LEDGER.md` to the paths itself.
 - **A file the task's list does not hold**: commit with `--reason "<why it belongs to the task>"`
   (15 or more characters). The path is added to the task's `files`, the addition is recorded in its

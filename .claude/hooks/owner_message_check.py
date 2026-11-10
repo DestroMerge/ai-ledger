@@ -28,7 +28,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 TAIL_BYTES = 4 * 1024 * 1024
+CONFIG = Path(__file__).resolve().parents[2] / "Docs" / "Ledger" / "ledger_config.json"
 FRESH = timedelta(minutes=15)
+
+
+def owner_name() -> str:
+    """The owner named in ledger_config.json, so the message says who wrote; "the user" when it cannot be read."""
+    try:
+        return json.loads(CONFIG.read_text(encoding="utf-8")).get("owner") or "the user"
+    except (OSError, ValueError, AttributeError):
+        return "the user"
 
 
 def when(entry: dict) -> datetime | None:
@@ -114,7 +123,7 @@ def main() -> int:
     lines = "\n".join("  \"" + (" ".join(t.split())[:400]) + "\"" for _, t in new)
     # Two kinds of message, not one: treating instructions like questions ("answer and end") made Claude reply
     # "I'll do it" and stop.
-    context = ("THE USER JUST WROTE TO YOU:\n" + lines + "\n"
+    context = (f"{owner_name().upper()} JUST WROTE TO YOU:\n" + lines + "\n"
                "If it ASKS something: stop the work you are doing; your next message answers it at the top, in plain "
                "words, and ends the reply - make no more tool calls than the answer itself needs. Do not write "
                "\"I'll answer at the end\". The work picks up after.\n"
