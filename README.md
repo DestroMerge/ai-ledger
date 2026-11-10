@@ -32,14 +32,16 @@ person (the "owner") who makes the calls, with Claude doing the work.
 
 | Path | What it is |
 |---|---|
-| `Docs/Ledger/ledger.py` | The tool: `next`, `show`, `start`, `done`, `block`, `note`, `commit`, `check`, `selftest`, and the department commands. One file, standard library only |
+| `Docs/Ledger/ledger.py` | The tool: `next`, `show`, `start`, `done`, `block`, `note`, `edit-task`, `add-plan`, `commit`, `check`, `selftest`, and the department commands. One file, standard library only |
 | `Docs/Ledger/README.md` | The manual: every command, rule and refusal |
 | `Docs/Ledger/epics/PR-E01.json` | An example epic: three tasks over two waves, a dependency, an open decision, a review subtask |
 | `Docs/Ledger/meta.json` | Waves, conventions, departments, where the audit starts |
 | `Docs/Ledger/ledger_web.py`, `web/` | A local web view (127.0.0.1 only): now, map, epics, tasks, decisions, commit activity. See "The ledger website" |
 | `Docs/Ledger/Ledger Web.bat`, `ledger_web.sh` | Double-click (Windows) or run (macOS, Linux) to start the web view and open it in your browser |
 | `Docs/Ledger/setup_ledger.py` | One-time setup: your id prefix, your name, git or Diversion |
-| `Docs/Ledger/add_epic.py` | Adds an epic with its first task |
+| `Docs/Ledger/add_epic.py` | Adds an epic with its first task (`ledger.py add-plan` files a whole plan from one JSON file) |
+| `Docs/Ledger/update_ledger.py` | Copies a newer version of the tool from this repository into a project that already uses it, leaving its data alone |
+| `.github/workflows/selftest.yml` | Runs the selftest on Windows and Linux on every push |
 | `.claude/settings.json` | Registers the two session hooks |
 | `.claude/hooks/ledger_stop.py` | Stop hook: no ending a reply while there's ledger work to do or a message unanswered |
 | `.claude/hooks/owner_message_check.py` | PostToolUse hook: tells Claude you wrote while it was working |
@@ -85,8 +87,9 @@ A local page for reading the ledger at a glance and answering decisions without 
 
 If `python` on your PATH is the Microsoft Store stub, put the full path to your Python in the `.bat`.
 
-You can run several sessions at once: the ledger is one file per epic, saves only write what changed, and a save over
-a file another session changed is refused rather than merged.
+You can run several sessions at once: the ledger is one file per epic, saves only write what changed, a save over a
+file another session changed is refused rather than merged, and `start` records which session holds a task, so a
+second session cannot take it without saying why (`--takeover`).
 
 ## Setup
 
@@ -119,6 +122,17 @@ You need Python 3.10+ and Claude Code. Git is the default version control; Diver
 **Windows:** the hooks and examples call `python`. If `python` on your PATH is the Microsoft Store stub, either
 install Python properly or replace `python` with the full path to your interpreter in `.claude/settings.json` and in
 the two agent files.
+
+## Updating
+
+Fixes land here first. In a project that already uses the ledger, pull this repository and run
+
+```
+python Docs/Ledger/update_ledger.py --from <path to your ai-ledger checkout>
+```
+
+It copies the tool's files (never your epics, `meta.json`, config, agents or settings), keeps your files' line
+endings, and runs the selftest. `python Docs/Ledger/ledger.py version` shows which version a project has.
 
 ## Notes
 

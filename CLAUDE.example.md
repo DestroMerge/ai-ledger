@@ -33,8 +33,11 @@ python Docs/Ledger/ledger.py check                # the gate: validate, render -
 - **Departments** are agents in `.claude/agents/` (Code Review, Game Design). This session is the hub: it files
   their subtasks, starts them with `dispatch`'s prompt word for word, and confirms and routes their findings. See
   the manual, "Department subtasks".
-- **Write `start` and `dispatch` so the stop hook sees them:** it finds the tasks this session took on by the text
-  `python ... ledger.py start <id>`. A shell variable in front of `ledger.py` hides them.
+- **`start` records who holds a task** (this Claude Code session, or `--by`), and the stop hook knows this
+  session's tasks from that. A task another session holds is theirs: take it over only with
+  `start <id> --takeover "<why>"`, when that session is gone. A done task comes back only with `--reopen "<why>"`.
+- **A plan change is a file:** `ledger.py add-plan --from plan.json` (`--dry-run` first) files waves, epics, tasks and
+  decisions together; `edit-task <id> --reason "..."` changes one task. Never a script that writes the JSON.
 
 ## Rules
 

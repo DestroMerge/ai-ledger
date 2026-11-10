@@ -1,0 +1,25 @@
+# The ledger's selftest on Windows and Linux, on every push and pull request. It plants each fault the tool must
+# refuse (with a clean control beside it) and runs the hooks on transcript lines of the shape Claude Code writes.
+name: selftest
+on:
+  push:
+  pull_request:
+jobs:
+  selftest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: selftest
+        run: python Docs/Ledger/ledger.py selftest
+      - name: the example ledger validates and LEDGER.md is current
+        run: |
+          python Docs/Ledger/ledger.py validate
+          python Docs/Ledger/ledger.py render --check

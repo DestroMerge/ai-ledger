@@ -3,3 +3,5 @@ Saved/
 __pycache__/
 *.pyc
 .claude/settings.local.json
+# A write that failed mid-way leaves its temporary file beside the target (ledger.py removes it; a crash may not)
+*.tmp

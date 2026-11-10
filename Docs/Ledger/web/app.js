@@ -35,7 +35,8 @@ function applyProfile(p) {
     + 'Stop it (close its window) and start it again.');
   P = p;
   const x = reEscape(p.idPrefix);
-  RE_REF = new RegExp(`${x}-E\\d{2}\\.\\d{2}(?!\\d)|${x}-E\\d{2}(?!\\d|\\.\\d)|${x}-D\\d{2,3}(?!\\d)|${p.commitId}`
+  const N = '(?:\\d{2}|[1-9]\\d{2})';  // an epic or task number: 01-99, then 100-999, as ledger.py's NUM
+  RE_REF = new RegExp(`${x}-E${N}\\.${N}(?!\\d)|${x}-E${N}(?!\\d|\\.\\d)|${x}-D\\d{2,3}(?!\\d)|${p.commitId}`
     + '|[\\w-]+(?:\\.[\\w-]+)*\\.(?:png|jpe?g|webp)', 'g');
   RE_OWNER = new RegExp(`\\b${reEscape(p.owner)}\\b`);
 }
@@ -713,9 +714,12 @@ function filteredTasks() {
     (!f.status.size || f.status.has(t.status) || (f.status.has('ready') && IX.ready.has(t.id))) &&
     (!f.epic || t.epic === f.epic) && (!f.wave || String(t.wave) === f.wave) &&
     (!f.owner || t.owner === f.owner) && (!f.size || t.size === f.size) && (!q || hay(t).includes(q)));
-  const key = { id: t => t.id, title: t => t.title.toLowerCase(), wave: t => t.wave, size: t => SIZE_RANK[t.size],
-                status: t => ATTENTION_RANK[t.status], epic: t => t.epic, owner: t => t.owner }[f.sort];
-  return rows.sort((a, b) => { const x = key(a), y = key(b); return (x < y ? -1 : x > y ? 1 : a.id < b.id ? -1 : 1) * f.dir; });
+  // Ids sort by number, so PR-E01.100 comes after PR-E01.99 (an epic holds up to 999 tasks).
+  const idKey = s => String(s).replace(/\d+/g, n => n.padStart(4, '0'));
+  const key = { id: t => idKey(t.id), title: t => t.title.toLowerCase(), wave: t => t.wave, size: t => SIZE_RANK[t.size],
+                status: t => ATTENTION_RANK[t.status], epic: t => idKey(t.epic), owner: t => t.owner }[f.sort];
+  return rows.sort((a, b) => { const x = key(a), y = key(b);
+    return (x < y ? -1 : x > y ? 1 : idKey(a.id) < idKey(b.id) ? -1 : 1) * f.dir; });
 }
 
 function refreshTaskTable() {
@@ -1205,6 +1209,11 @@ async function loadState() {
   if (!r.ok) throw new Error(j.error || r.statusText);
   applyProfile(j.derived.profile);
   document.title = j.ledger.title || 'Ledger';
+  // The header names the project from meta.json's title ("Atlas Ledger" reads ATLAS / Ledger), so the page needs
+  // no editing per project and a copy of the tool does not overwrite a project's name.
+  const name = (j.ledger.title || '').replace(/\s*ledger\s*$/i, '').trim();
+  const mark = document.querySelector('.wordmark');
+  if (mark && name) { mark.textContent = name.toUpperCase(); document.querySelector('.brand-sub').textContent = 'Ledger'; }
   S.ledger = j.ledger;
   S.derived = j.derived;
   S.answers = j.answers || {};

@@ -13,12 +13,14 @@ come from `ledger_config.json`.
 | `ledger_config.json` | The four settings that tie the tool to one project: id prefix, owner, version control, Unreal. See "Configuration" |
 | `ledger_web.py`, `web/` | A local web view of the ledger. It never writes the ledger; it files the owner's answers to open decisions in an inbox the tool reads |
 | `setup_ledger.py` | Writes the config, retags the example ledger to your prefix and owner, and starts the audit at your current commit |
-| `add_epic.py` | Adds an epic with its first task (there is no `ledger.py` command for it) |
+| `add_epic.py` | Adds one epic with its first task (`ledger.py add-plan` files several at once) |
+| `update_ledger.py` | Brings a project's copy of the tool up to date from an ai-ledger checkout, never touching its data (see "Updating the tool") |
 | `review_graph_dump.py` | Unreal projects only: dumps the Blueprint graphs a review covers, for a department agent that has no editor |
 
 The ledger lives in version control, so every session and every machine reads the same state.
 
-Python 3.10 or newer. No packages beyond the standard library.
+Python 3.10 or newer. No packages beyond the standard library. `python Docs/Ledger/ledger.py version` prints which
+copy of the tool this is; `check` prints it too.
 
 ## Configuration
 
@@ -41,6 +43,13 @@ hooks read it; nothing else in them names a project. `setup_ledger.py` writes it
 | `vcs` | The version control every log, diff and commit goes through: `git` or `diversion`. Each is a class in `ledger.py` (`Git`, `Diversion`); another system needs a class with the same attributes and methods, added to `VCS_BACKENDS` |
 | `unreal` | `true`: a `/Game/` asset path counts as evidence, and a review covering `.uasset` or `.umap` files needs their Blueprint graphs dumped before it is dispatched. `false`: neither, and department prompts name no editor |
 
+Two more keys may be left out:
+
+| Key | What it sets |
+|---|---|
+| `stampZone` | A short time zone label written after every note stamp: `"PT"` makes `2026-10-16 19:45 PT`. For a team whose machines keep different clocks. Empty by default |
+| `editorPython` | Unreal: the command that runs Python inside the open editor (a remote-execution script, say `"python Tools/ue_exec.py -c"`). When set, `dispatch` prints the whole graph-dump command with it |
+
 - A key starting with `_` is a note for the reader. A missing key, an unknown key or a bad value stops the tool with
   a message saying which.
 - What is the same in every project: the tool lives in `Docs/Ledger/` at the repository root, its working files (the
@@ -60,15 +69,21 @@ hooks read it; nothing else in them names a project. `setup_ledger.py` writes it
 3. `start` a task before working on it, `done` it with evidence, and commit through `ledger.py commit`.
 
 **The Stop hook.** `.claude/hooks/ledger_stop.py` runs every time Claude is about to end a reply. In a session that
-has started or dispatched a task (the ledger shows the command took), it blocks the ending once when there is work
-the hub can do without the owner - an answer to apply, a subtask to confirm, its own or a stale in-progress task, a
-ready task - and lists up to six. Claude then starts the first, or ends saying in one line why each needs the owner.
-It never acts in a session that has not worked the ledger, never blocks twice in a row, and on any error lets the
-reply end with a one-line message. It is registered in the checked-in `.claude/settings.json`, so every machine runs
-it.
+has started or dispatched a task, it blocks the ending once when there is work the hub can do without the owner - an
+answer to apply, a subtask to confirm, its own in-progress task or a stale one nobody holds, a ready task - and lists
+up to six. Claude then starts the first, or ends saying in one line why each needs the owner. It never acts in a
+session that has not worked the ledger, never pushes a session onto a task another session holds, never blocks twice
+in a row, and on any error lets the reply end with a one-line message. It is registered in the checked-in
+`.claude/settings.json`, so every machine runs it.
 
-The hook finds the tasks a session took on by the text `python ... ledger.py start <id>` in its tool calls. A shell
-variable in front of `ledger.py` (`$PY Docs/Ledger/ledger.py start ...`) hides it; write `python` or `python3`.
+The hook knows which tasks a session took on from the ledger, not from the text of its commands: `start` and
+`dispatch` record the session's id (Claude Code puts it in `CLAUDE_CODE_SESSION_ID` in every shell it runs, and hands
+the same id to its hooks), so `uv run`, a variable prefix or a full path to Python all count. A ledger.py run outside
+Claude Code records no session; for those the hook still looks for `ledger.py start <id>` in the session's commands.
+
+The hooks read transcript fields Claude Code does not document (`turnOrigin`, `queue-operation`, `queued_command`).
+If an update renames one, the Stop hook says so once per session; `ledger.py selftest` runs both hooks and the fence
+on transcript lines of the shape they expect.
 
 ## Daily use
 
@@ -84,17 +99,51 @@ python Docs/Ledger/ledger.py check
 A department's review or measure runs through `dispatch`, `submit` and `confirm` instead of `start` and `done`:
 see "Department subtasks" below.
 
+- **`done`** needs evidence that starts with its label: `ran-it`, `read-in-the-code` or `read-in-a-document`, then
+  what was observed. A task is started before it is done.
 - **`note`** appends to a task's notes, stamped from the clock.
 - **`add-task --epic PR-Enn --from task.json`** adds a task under the next free id in that epic.
   The file holds the task's fields (`title`, `owner`, `size`, `wave`, `files`, `acceptance`, and
-  `dependsOn` or `notes` if it has them); the tool sets `id`, `epic` and `status`.
+  `dependsOn` or `notes` if it has them); the tool sets `id`, `epic` and `status`. A title an open task already
+  carries is refused (case and spacing aside) unless `--same-title-ok`.
 - **`add-decision --epic PR-Enn --from decision.json`** adds an open decision under the next free
   `PR-Dnn`, filed in that epic's file. The file holds `question`, `recommendation`, `options` and
   `source`.
+- **`add-plan --from plan.json`** files waves, epics, tasks and decisions in one go - see "Filing a plan".
+- **`edit-task <task> --reason "..."`** changes an unfinished task's `--title`, `--wave`, `--depends-on` (the whole
+  list, or `none`), `--files` (the whole list) or `--check` / `--expect`. Each change is recorded in the task's
+  `edits` with the old value, the new one and the reason.
 - **`withdraw <task> --reason "..."`** takes an unfinished task out of the plan (status `withdrawn`, the reason
   stamped into its notes). Never a done task, nor a department subtask in progress.
-- **A new epic** comes from `add_epic.py`, with its first task.
+- **A new epic** comes from `add_epic.py`, with its first task, or from a plan. An epic's title an open epic already
+  carries is refused unless `--same-title-ok`.
 - Commit an add straight away, with `--role Ledger`, so another session cannot take the same id.
+- Ids: epics and tasks take two digits, then three - an epic past `PR-E01.99` goes on to `PR-E01.100`, up to 999.
+  Epic files are read in number order, so `PR-E100` comes after `PR-E99`.
+- `validate` refuses a field it does not know (a misspelled `dependOn` would otherwise be ignored, and the task
+  listed ready while its real dependency is unfinished) and a wave the `waves` table in `meta.json` does not name.
+
+### Who holds a task
+
+`start` records who holds the task, and nothing else can quietly take it:
+
+```
+python Docs/Ledger/ledger.py start PR-E02.01                     # holder: this Claude Code session
+python Docs/Ledger/ledger.py start PR-E02.01 --by "Sam"          # holder: a name
+python Docs/Ledger/ledger.py start PR-E02.01 --takeover "the session that held it was closed"
+python Docs/Ledger/ledger.py start PR-E02.01 --reopen "the fix did not hold in play"
+python Docs/Ledger/ledger.py start PR-E02.01 --files Source/Save/ Source/SaveGame.h
+```
+
+- The holder is `--by`, or else this Claude Code session (`heldBy` and `session` on the task). `next` prints who
+  holds each task in progress.
+- `start` on a task in progress under another holder is refused unless `--takeover "<why>"` (15+ characters); the
+  takeover is noted. A task in progress with no holder recorded (one started before this rule) is simply claimed.
+- A status moves only planned to in-progress to done, with blocked and back, and withdrawn from any unfinished
+  state. `done` on a task never started is refused. A done or withdrawn task comes back only with
+  `--reopen "<why>"`, which moves its evidence and landed commit into its `reopened` history.
+- `start` prints each files entry the task shares with another open task. `--files` narrows the list to entries
+  inside the ones it has (the old list is kept in `edits`, so the audit still accepts commits made under it).
 
 ### Blocked tasks
 
@@ -126,11 +175,46 @@ python Docs/Ledger/ledger.py block PR-E02.01
 - When the current wave has nothing ready, `next` also lists ready tasks in later waves, even while
   the current wave still has tasks in progress.
 
+### Filing a plan
+
+A plan change of any size is one file, checked and written all together or not at all:
+
+```
+python Docs/Ledger/ledger.py add-plan --from plan.json --dry-run    # check it, print the ids it would take
+python Docs/Ledger/ledger.py add-plan --from plan.json
+```
+
+```json
+{
+  "waves": {"12": "Save and load"},
+  "epics": [{"key": "save", "title": "Save and load", "goal": "Progress survives a restart",
+             "plan": "Docs/Design/saves.md",
+             "tasks": [{"key": "fmt", "title": "Save format", "owner": "Engineering", "size": "S", "wave": 12,
+                        "files": ["Source/Save/"], "acceptance": {"check": "...", "expect": "..."}}]}],
+  "tasks": [{"epic": "PR-E03", "title": "Save from the pause menu", "owner": "Engineering", "size": "S",
+             "wave": 12, "files": ["Source/UI/Pause.cpp"], "acceptance": {"check": "...", "expect": "..."},
+             "dependsOn": ["@fmt", "@autosave"]}],
+  "decisions": [{"key": "autosave", "epic": "@save", "question": "Autosave?", "recommendation": "Every minute",
+                 "options": [{"label": "Every minute", "detail": "...", "recommended": true},
+                             {"label": "By hand only", "detail": "..."}]}]
+}
+```
+
+- `waves` names new waves (a plan adds waves; it does not rename one). `epics` are new epics, each with at least one
+  task. `tasks` go under existing epics (or `@key` of a new one). `decisions` are new open decisions.
+- A `key` names an item inside the plan; `@key` in `epic`, `dependsOn` or `parent` stands for the id it gets. Ids
+  are the next free ones, in the file's order.
+- Every rule `add-task` and `add-decision` apply holds, titles included. Commit the result straight away with
+  `--role Ledger`.
+
 ### Committing
 
 The commit's subject starts with the task id (`PR-E02.01: ...`), an epic id, or the commit names a
 role (`--role Owner|Repair|Checkpoint|Ledger --reason "..."`).
 
+- The role comes from `--role` only. A `Role:` line typed into the message file is refused: the tool writes the
+  `Role:` and `Reason:` lines itself, and the audit refuses a commit whose Role line has no Reason line.
+- A message file may start with a byte order mark (Windows PowerShell 5.1 writes one); it is dropped.
 - The tool adds the named task's epic file and `LEDGER.md` to the paths itself.
 - **A file the task's list does not hold**: commit with `--reason "<why it belongs to the task>"`
   (15 or more characters). The path is added to the task's `files`, the addition is recorded in its
@@ -176,9 +260,12 @@ The template ships two example departments, listed in `meta.json` `departments`:
 - **What keeps an agent to its own subtask is a hook, the tool's own checks, and rules.** Each agent file registers
   `.claude/hooks/department_fence.py` as a PreToolUse hook, which runs before every shell command and file write
   that agent makes and refuses: `ledger.py` with any subcommand but the agent's seven (`show`, `next`, `findings`,
-  `start`, `finding`, `submit`, `block`); Python that imports the ledger module; running `claude`; `git commit` or
-  `dv commit`; and a Write or Edit under `Docs/Ledger/`. It matches real invocations, so a grep or an echo that
-  names a command passes. The tool takes `confirm` and `route` only from the dispatching hub and `start` only as
+  `start`, `finding`, `submit`, `block`), however the script is run (`python`, a full path, `uv run`, an env prefix,
+  `./Docs/Ledger/ledger.py`); Python that loads the ledger module (import, `importlib`, `__import__`, `runpy`);
+  running `claude`; `git commit` or `dv commit`, options before the subcommand included (`git -C . commit`); a
+  redirect or a file command (`tee`, `cp`, `Set-Content`, `sed -i` ...) into `Docs/Ledger/`; and a Write or Edit
+  under it. A command is split at `;`, `&&`, `|` and the like, and each piece is judged by its first word, so a grep
+  or an echo that names a command passes. The tool takes `confirm` and `route` only from the dispatching hub and `start` only as
   `<owner> agent`. The rest is rules in the agent file and the dispatch prompt - a shell can reach `claude` by routes
   the hook does not parse. A permission allowlist is no fence: in auto mode, a command missing from it goes to the
   auto-mode classifier, not to a prompt. An agent file is read when a session starts, so a hub session older than a
@@ -193,7 +280,10 @@ The template ships two example departments, listed in `meta.json` `departments`:
    graphs first: the department agent has no editor, so the hub, which owns it, runs `review_graph_dump.py` inside
    the editor (`dispatch` prints what to run), then dispatches with `--dump <folder>`.
 3. **`dispatch <id> --by "<hub title>"`** prints the agent and its prompt. Start it with the Agent tool, that
-   agent as the subagent type, the prompt word for word. A review runs in the background; a measure runs in the
+   agent as the subagent type, the prompt word for word. A review's agent reads the covered files as they stand in
+   the working copy - Diversion has no command that prints a file as of a commit - so `dispatch` refuses while any of
+   them has uncommitted changes (another session's edit in progress). Commit or wait, or send it anyway with
+   `--dirty-ok "<why>"`: the prompt then names those files, and a note says why. A review runs in the background; a measure runs in the
    foreground, so a shared resource (an editor, a device) has one owner while it works. A background agent's
    permission prompt waits in the hub session for an answer.
 4. **When it returns**, `next` lists it under `TO CONFIRM`. Re-open one pointer. Then ask the one question a
@@ -232,7 +322,7 @@ free, the owner is needed), it runs `block <id> --on "..." --until none` and say
 
 | Kind | `check` | `expect` |
 |---|---|---|
-| `review` | Read the covered tasks' files at their landed commits for `<focus>` | The evidence names every covered file with a verdict, `clean` or `finding N` (a `clean` resting on a guard names it); each problem found is a finding with a pointer |
+| `review` | Read the covered tasks' files, as they stand in the working copy, for `<focus>` | The evidence names every covered file with a verdict, `clean` or `finding N` (a `clean` resting on a guard names it); each problem found is a finding with a pointer |
 | `measure` | `<the command or test to run>` | `<metric>` is within `<budget>`, with the output line quoted and its log path given |
 | `produce` | Make `<the asset>` with `<the pipeline>` | Every asset made or changed is named with its path and a capture; any approval gate still due is named |
 
@@ -241,7 +331,9 @@ free, the owner is needed), it runs `block <id> --on "..." --until none` and say
 ### Writing your own department
 
 Copy one of the example agent files. Keep the frontmatter `hooks:` block (it registers the fence), the department
-steps and the "How you work" list; rewrite "What you look for" and "Severity" for the department's job. Add it to
+steps and the "How you work" list; rewrite "What you look for" and "Severity" for the department's job, and do it
+before the first dispatch: the examples' lists are not your project's rules (which module may include what, where
+numbers live, what counts as a blocker), and a review only finds what its list names. Add it to
 `meta.json` `departments` with its `name`, `agent` (the file name without `.md`), `editor` (`none`, `foreground`
 for a department that needs a shared resource while it runs, or `owns` for the hub) and a `does` line. Start a new
 Claude Code session afterwards: agent files are read when a session starts.
@@ -256,11 +348,18 @@ they do not overwrite each other:
 - If another session changed a file after this command read it, and this command would change the
   same file, the save is **refused** (`LedgerConflict`) and nothing is written. Run the command again;
   it reads the files afresh.
-- Commands that change the ledger hold `Saved/Ledger/ledger.lock` while they run, so two runs of the
-  tool do not interleave. `save()` takes the same lock for its compare-and-write, so a script's save is
-  covered too, and a run that already holds it takes it again freely. A lock is taken over only when the
-  process it names has exited, never because it is old: a run waits up to 30 seconds for a live holder,
-  then refuses. A run removes the lock only while it still holds its own token.
+- Commands that change the ledger hold a lock on `Saved/Ledger/ledger.lock` while they run, so two runs of the
+  tool do not interleave. It is the operating system's own file lock (`msvcrt.locking` on Windows, `flock`
+  elsewhere): the system frees it when the run ends, however it ends, so a crashed run never leaves a lock behind
+  and there is no takeover to race over. `save()` takes the same lock for its compare-and-write, so a script's save
+  is covered too, and a run that already holds it takes it again freely. A run waits up to 30 seconds for the
+  holder, then refuses, quoting the holder's note (process id, since when, what it runs).
+- On Windows a file another program has open (the website re-reading `LEDGER.md`, a sync agent, an editor) cannot
+  be replaced. A write retries for a few seconds; a save that changes two files writes both or neither. When only
+  `LEDGER.md` cannot be written, the command says the change is saved and `LEDGER.md` is behind; the next command
+  that renders, or `render`, catches it up.
+- `LEDGER.md` is generated and committed with the work, so two branches that each finish a task can conflict on it.
+  Settle such a conflict with `python Docs/Ledger/ledger.py render`, never by hand.
 - The website's answers inbox (`Saved/Ledger/answers.json`) is written under the same lock by both the page
   and `apply`, which re-reads it just before removing the answer it applied. An inbox that cannot be read is
   refused, never read as empty.
@@ -279,6 +378,10 @@ they do not overwrite each other:
 2. **render --check** - `LEDGER.md` matches the JSON.
 3. **audit** - every commit after `auditFrom`, read from the version control's log, is judged:
    - a commit that names a task must name a real one that has been started;
+   - a commit that names a task (or an epic) and carries no role changes only files inside that task's files list
+     (every list it has held counts), so a commit made with `git` directly cannot slip work past the file rule;
+   - a commit with a `Role:` line carries a `Reason:` line of 15+ characters, as every role commit the tool makes
+     does;
    - a commit made outside the tool (no task, no role) that touched a file of a task in progress is
      refused, unless it is recorded in `meta.json` `outsideCommits` with a reason;
    - every done task has a `landed` commit, and that commit names the task.
@@ -358,9 +461,34 @@ A session that writes a new decision writes its options with it (`add-decision`)
   task, or again once it is handed in; `decide` with no `--by`; a `meta.json` with no `departments` list.
 - A commit outside the tool that touched an in-progress task's files, unless it is recorded in
   `outsideCommits` with a reason.
+- A commit naming a task that changed files outside its list; a Role line typed into a message file; a Role line
+  with no Reason line.
+- `start` on a task another holder has, without `--takeover`; `start` on a done or withdrawn task without
+  `--reopen`; `done` on a task never started; evidence without its label.
+- A second `decide` on a decided decision without `--supersede` (the old ruling is kept); a ruling date that is not
+  a date, or is in the future.
+- A field the tool does not know; a wave the waves table does not name; a title an open epic or task already
+  carries, without `--same-title-ok`.
+- A review dispatched while its covered files have uncommitted changes, without `--dirty-ok`.
 
 `python Docs/Ledger/ledger.py selftest` plants each of these faults and shows it refusing, with a
-clean control beside each one. Run it whenever `ledger.py` changes.
+clean control beside each one, and runs the hooks on transcript lines of the shape Claude Code writes. Run it
+whenever the tool changes. The repository runs it on Windows and Linux on every push (`.github/workflows/`).
+
+## Updating the tool
+
+ai-ledger is where the tool is fixed. A project copies it down, never the other way:
+
+```
+python Docs/Ledger/update_ledger.py --from ../ai-ledger --dry-run
+python Docs/Ledger/update_ledger.py --from ../ai-ledger
+```
+
+It copies the tool's files (`ledger.py`, `ledger_web.py`, `review_graph_dump.py`, `add_epic.py`,
+`update_ledger.py`, this manual, `web/`, and the three hooks), keeps each file's line endings as the project has
+them, never touches the project's data (`ledger_config.json`, `meta.json`, `epics/`, `LEDGER.md`) or its own agents
+and settings, and runs the selftest. `ledger.py version` says which copy a project runs. Raise `VERSION` in
+`ledger.py` with every change to the tool.
 
 ## Waves, and why
 

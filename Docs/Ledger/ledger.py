@@ -24,11 +24,18 @@ Unreal. README.md, "Configuration".
     python Docs/Ledger/ledger.py next                  where we are, and what can start now
     python Docs/Ledger/ledger.py status                progress per epic
     python Docs/Ledger/ledger.py show <id>             one task or decision in full
-    python Docs/Ledger/ledger.py start <task> [--by NAME]   planned -> in-progress (refuses unmet dependencies);
+    python Docs/Ledger/ledger.py version               which copy of the tool this is (`check` prints it too)
+    python Docs/Ledger/ledger.py start <task> [--by NAME] [--files P...] [--takeover "<why>"] [--reopen "<why>"]
+                                                       planned -> in-progress (refuses unmet dependencies). Records
+                                                       who holds it (--by, else this Claude Code session); refuses
+                                                       a task another holder has unless --takeover; a done task
+                                                       comes back only with --reopen. --files narrows its list.
                                                        --by is required on a department subtask
-    python Docs/Ledger/ledger.py done <task> --evidence "<ran-it: what ran and what it showed>"
+    python Docs/Ledger/ledger.py done <task> --evidence "<ran-it|read-in-the-code|read-in-a-document: what showed>"
+    python Docs/Ledger/ledger.py edit-task <task> --reason "<why>" [--title T] [--wave N] [--depends-on ID...|none]
+                                                       [--files P...] [--check C] [--expect E]
   Department subtasks (a task with 'kind'; README "Department subtasks"):
-    python Docs/Ledger/ledger.py dispatch <task> --by "<hub title>" [--dump <folder>] [--restart]
+    python Docs/Ledger/ledger.py dispatch <task> --by "<hub title>" [--dump <folder>] [--restart] [--dirty-ok "<why>"]
                                                        hub: freeze what it covers, print the agent and its prompt
     python Docs/Ledger/ledger.py submit <task> --evidence "..."   department agent: hand the work in (stays in progress)
     python Docs/Ledger/ledger.py confirm <task> --by "<hub title>" --evidence "..."   hub: one pointer re-checked; done
@@ -39,7 +46,10 @@ Unreal. README.md, "Configuration".
     python Docs/Ledger/ledger.py note <id> --text "<text>"   append to a task's notes, stamped from the clock
     python Docs/Ledger/ledger.py add-task --epic PR-Enn --from <file.json>      next free id in that epic
     python Docs/Ledger/ledger.py add-decision --epic PR-Enn --from <file.json>  next free PR-Dnn
+    python Docs/Ledger/ledger.py add-plan --from <plan.json> [--dry-run]         epics, tasks, decisions and wave
+                                                       names in one go, all or nothing (README "Filing a plan")
     python Docs/Ledger/ledger.py decide <decision> --ruling "<text>" --by <who ruled> --date YYYY-MM-DD
+                                                       [--supersede "<why>"] (a ruled decision changes only so)
     python Docs/Ledger/ledger.py apply <decision>      make the answer the owner gave on the website the ruling (`next` lists them)
     python Docs/Ledger/ledger.py render [--check]      write LEDGER.md, or refuse if it is stale
     python Docs/Ledger/ledger.py validate              structural rules, every one refuses
@@ -61,20 +71,28 @@ Commit rules (each refuses rather than warns):
      records them in the task's filesAdded with the reason and the date, and goes on; without --reason it
      refuses and says so. (add the file with a written reason, do not refuse.)
   6. When a ledger file is among the paths, validate and render --check must pass.
-  7. Paths are explicit. There is no -a, and no shell sits between this tool and dv.
+  7. Paths are explicit. There is no -a, and no shell sits between this tool and the version control.
+  8. A role is named with --role only. A `Role:` line typed into the message file is refused: the tool writes the
+     Role and Reason lines itself, so the audit can trust them.
   The old name Docs/Ledger/ledger.json among the paths stands for the named task's epic file (or, in a role
   commit, every ledger file with changes), so callers written before the split still commit the right file.
   After the commit, a task that is done and unlanded gets landed stamped with the new commit id, and its
   epic's ledger file is committed alone as a second commit naming the same task.
 
-Audit: walks `dv log` from the ledger's auditFrom (exclusive) to head, and refuses when:
+Audit: walks the version control's log (`git log`, or `dv log`) from the ledger's auditFrom (exclusive) to head,
+and refuses when:
   - a commit names an unknown id, or a task still planned;
+  - a commit names a task (or epic) and carries no role, and a path it changed lies outside that task's files list
+    (every list the task has held counts, so a list narrowed later does not fail old commits) - a commit made with
+    the version control directly cannot slip work past the file rule;
+  - a commit carries a Role line with no Reason line of 15+ characters (the tool writes both);
   - a commit names nothing, carries no valid role, AND touched a file of a task that is in progress now,
     unless the commit is recorded in outsideCommits with a reason;
   - a done task has no landed, or no evidence;
-  - dv log is empty or does not reach auditFrom.
-  dv log answers at most 1000 commits a call, so the walk pages back with --until until it reaches
-  auditFrom. A commit's paths are cached in Saved/Ledger/commit_paths.json (a commit never changes).
+  - the log is empty or does not reach auditFrom.
+  Diversion's dv log answers at most 1000 commits a call, so the walk pages back with --until until it reaches
+  auditFrom; git's log comes whole. A commit's paths are cached in Saved/Ledger/commit_paths.json (a commit never
+  changes).
   Commits that name nothing and touch no in-progress file are out of the ledger's scope. They are counted
   and listed, never refused: other departments commit to this repository too.
   LIMIT, stated plainly: the scope test uses the in-progress set as it is when the audit runs, not as it
@@ -94,8 +112,12 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# Which copy of the tool this is. Projects copy the tool from the ai-ledger repository (update_ledger.py), so a copy
+# that has fallen behind shows here and in `check`. Raise it with every change to the tool files.
+VERSION = "2026.11.09"
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -111,8 +133,15 @@ LEDGER_JSON = HERE / "ledger.json"
 LEDGER_REL = "Docs/Ledger/ledger.json"
 SPLIT_KEYS = ("epics", "tasks", "decisions")
 LOCK = REPO / "Saved" / "Ledger" / "ledger.lock"
-LOCK_WAIT_S = 30.0  # how long a run waits for a live holder before it refuses (a dead holder's lock is taken over)
+LOCK_WAIT_S = 30.0  # how long a run waits for the run holding the lock before it refuses
 PATHS_CACHE = REPO / "Saved" / "Ledger" / "commit_paths.json"
+# On Windows a file another program has open (the website re-reading LEDGER.md, a sync agent, an editor) cannot be
+# replaced until it lets go, and os.replace fails with "Access is denied". A write retries this long first.
+REPLACE_RETRY_S = 3.0
+# LEDGER.md retries for less: it is held open far more often (the website re-reads it), a run holds the ledger lock
+# while it waits, and a LEDGER.md left behind is caught up by the next render. Under a reader that held it open
+# nearly all the time, 24 runs at once each waited the full 3 s inside the lock and most timed out queueing for it.
+RENDER_RETRY_S = 1.0
 REASON_MIN = 15
 # The answers the owner gives on the ledger website (ledger_web.py). The website writes only this
 # file; `apply` turns an answer into the decision's ruling. It sits under Saved/, which version control ignores: an
@@ -127,8 +156,36 @@ DECISION_STATUSES = ["open", "decided"]
 SIZES = ["S", "M", "L"]
 # The id patterns (RE_EPIC, RE_TASK, RE_DECISION, RE_SUBJECT_ID, RE_EPIC_FILE, RE_ANY_ID, RE_FINDING_REF), the commit id
 # pattern (RE_COMMIT_ID), RE_POINTER and LOG_LIMIT are set from the project config: apply_config() below.
+# An epic or task number is two digits (01-99), then three (100-999): a busy project filled E99 and .99.
+NUM = r"(?:\d{2}|[1-9]\d{2})"
+ID_MAX = 999
 RE_ROLE_LINE = re.compile(r"^\s*Role:\s*(\S+)\s*$", re.M)
+RE_REASON_LINE = re.compile(r"^\s*Reason:\s*(.*\S)\s*$", re.M)
 FINISHED = {"done", "withdrawn"}
+# The moves a task's status may make through set_status. A done or withdrawn task comes back only through
+# `start --reopen`; a task is started before it is done. (save() releases a blocked task to planned by itself.)
+MOVES = {
+    "planned": {"in-progress", "blocked", "withdrawn"},
+    "in-progress": {"in-progress", "blocked", "done", "withdrawn"},
+    "blocked": {"blocked", "in-progress", "planned", "withdrawn"},
+    "done": set(),
+    "withdrawn": set(),
+}
+# Evidence for `done` starts with one of these labels (meta.json conventions, "evidence").
+EVIDENCE_LABELS = ("ran-it", "read-in-the-code", "read-in-a-document")
+RE_EVIDENCE_LABEL = re.compile(r"^\s*(?:" + "|".join(map(re.escape, EVIDENCE_LABELS)) + r")\b")
+# The fields each record may carry. validate() refuses any other, so a misspelled 'dependOn' cannot pass as no
+# dependency at all. The owner's needs field (needsSam) is added from the config.
+EPIC_FIELDS = {"id", "title", "status", "plan", "goal"}
+TASK_FIELDS = {"id", "epic", "title", "owner", "size", "wave", "files", "acceptance", "status", "dependsOn", "notes",
+               "evidence", "landed", "blockedOn", "waitsOn", "blockedAt", "startedAt", "heldBy", "session", "kind",
+               "parent", "covers", "dispatchedAt", "dispatchedBy", "dispatchedSession", "dump", "submittedAt",
+               "confirmed", "findings", "filesAdded", "reopened", "edits"}
+DECISION_FIELDS = {"id", "epic", "question", "recommendation", "status", "options", "ruling", "ruledBy", "ruledOn",
+                   "ruledVia", "chosen", "note", "source", "superseded"}
+FINDING_FIELDS = {"n", "severity", "text", "evidence", "by", "at", "routed"}
+# The task fields edit-task may change.
+EDITABLE = ("title", "wave", "dependsOn", "files", "acceptance")
 # A blocker names what releases it ('waitsOn'), save() releases the task once all of those are
 # decided or finished, and `next` says how old every blocker and every in-progress task is. Blocker text alone went
 # stale: decisions were applied, the tasks they gated stayed "blocked on Decision PR-Dnn", and `next` kept telling the owner
@@ -144,8 +201,9 @@ STALE_DAYS = 3  # a blocker or an in-progress task untouched this long is re-che
 KINDS = ["review", "measure", "produce"]
 EDITOR_USES = ["owns", "foreground", "none"]
 # A finding is recorded on its subtask, not filed. The hub routes every finding - to the task that fixes it, or rejected
-# with a reason - before it confirms. 'blocker' is item loss or duplication on the priority path: its fixing task goes
-# on the critical path now. 'hardening' is everything else: its fixing task goes in the wave the work belongs to.
+# with a reason - before it confirms. 'blocker': its fixing task goes on the critical path now; what counts as one is
+# the department's to define (its agent file, and meta.json's conventions, "findings"). 'hardening' is everything
+# else: its fixing task goes in the wave the work belongs to.
 # No hardcoded hardening wave. Hardening findings used to wait, unfiled, until a late hardening wave
 # was current; most were routed early on the owner's word anyway, so the wait added paperwork and no filter.
 SEVERITIES = ["blocker", "hardening"]
@@ -171,11 +229,18 @@ class LedgerConflict(LedgerError):
 #   vcs       the version control every log, diff and commit goes through: a key of VCS_BACKENDS
 #   unreal    true for an Unreal project: a /Game/ asset path counts as evidence, and a review covering .uasset or
 #             .umap files needs their Blueprint graphs dumped before it is dispatched
+# Two more may be left out (OPTIONAL_CONFIG gives their defaults):
+#   stampZone     a short time zone label written after every note stamp ("PT" makes "2026-10-16 19:45 PT"), for a
+#                 team whose machines keep different clocks; empty by default
+#   editorPython  (Unreal) the command that runs Python inside the open editor, such as a remote-execution script;
+#                 when set, `dispatch` prints the whole graph-dump command line with it
 # Paths stay fixed: the tool lives in Docs/Ledger/ at the repository root, and its working files in Saved/Ledger/.
 
 CONFIG_JSON = HERE / "ledger_config.json"
 CONFIG_KEYS = ("idPrefix", "owner", "vcs", "unreal")
+OPTIONAL_CONFIG = {"stampZone": "", "editorPython": ""}
 RE_PREFIX = re.compile(r"^[A-Z][A-Z0-9]{0,7}$")
+RE_ZONE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+:\-]{0,9})?$")
 # The settings the selftest's fixtures are written in. selftest() runs under these whatever the project's own are.
 SELFTEST_PROFILE = {"idPrefix": "PR", "owner": "Sam", "vcs": "diversion", "unreal": True}
 
@@ -393,9 +458,14 @@ def config_errors(cfg) -> list[str]:
     a note for the reader."""
     if not isinstance(cfg, dict):
         return ["the config is one JSON object"]
-    errs = [f"unknown key '{k}' (the keys are {', '.join(CONFIG_KEYS)}; a key starting with '_' is a note)"
-            for k in cfg if k not in CONFIG_KEYS and not str(k).startswith("_")]
+    errs = [f"unknown key '{k}' (the keys are {', '.join(CONFIG_KEYS + tuple(OPTIONAL_CONFIG))}; a key starting with "
+            f"'_' is a note)" for k in cfg if k not in CONFIG_KEYS and k not in OPTIONAL_CONFIG
+            and not str(k).startswith("_")]
     errs += [f"missing key '{k}'" for k in CONFIG_KEYS if k not in cfg]
+    if "stampZone" in cfg and not (isinstance(cfg["stampZone"], str) and RE_ZONE.match(cfg["stampZone"])):
+        errs.append("stampZone is a short time zone label such as PT or UTC+1, or empty")
+    if "editorPython" in cfg and not isinstance(cfg["editorPython"], str):
+        errs.append("editorPython is the command that runs Python in the open editor, as text")
     if "idPrefix" in cfg and not (isinstance(cfg["idPrefix"], str) and RE_PREFIX.match(cfg["idPrefix"])):
         errs.append(f"idPrefix '{cfg['idPrefix']}' is 1 to 8 capital letters or digits starting with a letter, "
                     f"such as PR")
@@ -421,7 +491,7 @@ def load_config(path: Path | None = None) -> dict:
     errs = config_errors(cfg)
     if errs:
         raise LedgerError(f"{path}: {'; '.join(errs)}")
-    return {k: cfg[k] for k in CONFIG_KEYS}
+    return {**{k: cfg[k] for k in CONFIG_KEYS}, **{k: cfg.get(k, d) for k, d in OPTIONAL_CONFIG.items()}}
 
 
 def apply_config(cfg: dict) -> None:
@@ -429,20 +499,23 @@ def apply_config(cfg: dict) -> None:
     fixtures' settings and to a made-up project's, and back."""
     global CONFIG, PREFIX, OWNER, NEEDS_OWNER, UNREAL, VCS, LOG_LIMIT, EPIC_GLOB, RE_EPIC, RE_TASK
     global RE_DECISION, RE_SUBJECT_ID, RE_EPIC_FILE, RE_ANY_ID, RE_FINDING_REF, RE_COMMIT_ID, RE_POINTER
+    global STAMP_ZONE, EDITOR_PYTHON
     CONFIG = dict(cfg)
     PREFIX, OWNER, UNREAL = cfg["idPrefix"], cfg["owner"], cfg["unreal"]
+    STAMP_ZONE = cfg.get("stampZone", OPTIONAL_CONFIG["stampZone"])
+    EDITOR_PYTHON = cfg.get("editorPython", OPTIONAL_CONFIG["editorPython"])
     NEEDS_OWNER = "needs" + re.sub(r"\W", "", OWNER)
     VCS = VCS_BACKENDS[cfg["vcs"]]()
     LOG_LIMIT = VCS.LOG_LIMIT
     p = re.escape(PREFIX)
     EPIC_GLOB = f"{PREFIX}-E*.json"
-    RE_EPIC = re.compile(rf"^{p}-E\d{{2}}$")
-    RE_TASK = re.compile(rf"^{p}-E\d{{2}}\.\d{{2}}$")
+    RE_EPIC = re.compile(rf"^{p}-E{NUM}$")
+    RE_TASK = re.compile(rf"^{p}-E{NUM}\.{NUM}$")
     RE_DECISION = re.compile(rf"^{p}-D\d{{2,3}}$")
-    RE_SUBJECT_ID = re.compile(rf"^({p}-E\d{{2}}(?:\.\d{{2}})?)(?![\d.])")
-    RE_EPIC_FILE = re.compile(rf"^Docs/Ledger/epics/({p}-E\d{{2}})\.json$")
-    RE_ANY_ID = re.compile(rf"\b{p}-(?:D\d{{2,3}}|E\d{{2}}\.\d{{2}})\b")
-    RE_FINDING_REF = re.compile(rf"({p}-E\d{{2}}\.\d{{2}})#(\d+)")
+    RE_SUBJECT_ID = re.compile(rf"^({p}-E{NUM}(?:\.{NUM})?)(?![\d.])")
+    RE_EPIC_FILE = re.compile(rf"^Docs/Ledger/epics/({p}-E{NUM})\.json$")
+    RE_ANY_ID = re.compile(rf"\b{p}-(?:D\d{{2,3}}|E{NUM}\.{NUM})\b")
+    RE_FINDING_REF = re.compile(rf"({p}-E{NUM}\.{NUM})#(\d+)")
     RE_COMMIT_ID = VCS.RE_ID
     # A pointer is something the hub can open and check: a commit id, (Unreal) a /Game/ asset path with its node named
     # beside it, an absolute path, or a repo path with a file extension (optionally :line or :line-line). It proves a
@@ -494,6 +567,18 @@ def decision_num(i: str) -> int:
     return int(m.group(1)) if m else 0
 
 
+def epic_num(i: str) -> int:
+    """The number of an epic id (PR-E07 -> 7); epic files sort by it, so E100 comes after E99, not after E10."""
+    m = re.search(r"-E(\d+)$", i)
+    return int(m.group(1)) if m else 0
+
+
+def task_num(i: str) -> int:
+    """The number of a task within its epic (PR-E07.12 -> 12)."""
+    m = re.search(r"\.(\d+)$", i)
+    return int(m.group(1)) if m else 0
+
+
 def load(root: Path | None = None, track: bool = True) -> dict:
     """The whole ledger as one dict: meta.json's keys, plus "epics", "tasks" and "decisions" gathered from every
     epics/PR-Enn.json in epic order (each file's own order kept). track=False for a reader that never saves."""
@@ -513,7 +598,7 @@ def load(root: Path | None = None, track: bool = True) -> dict:
             raise LedgerError(f"{meta_p} carries '{k}', which lives in the epic files")
         ledger[k] = []
     snap = {meta_p.name: meta_text}
-    for p in sorted((root / "epics").glob(EPIC_GLOB)):
+    for p in sorted((root / "epics").glob(EPIC_GLOB), key=lambda p: (epic_num(p.stem), p.stem)):
         text = p.read_text(encoding="utf-8")
         data = json.loads(text)
         e = data.get("epic") or {}
@@ -571,12 +656,46 @@ def _dump(obj) -> str:
     return json.dumps(obj, indent=2, ensure_ascii=False) + "\n"
 
 
-def _write_atomic(p: Path, text: str) -> None:
+_os_replace = os.replace  # the selftest stands in a replace that fails, as a file held open makes it on Windows
+
+
+def _replace(tmp: Path, p: Path, retry: float | None = None) -> None:
+    """os.replace, retried for REPLACE_RETRY_S while the target is held open by another program (Windows refuses to
+    replace an open file: the website re-reads LEDGER.md whenever the ledger changes, and a sync agent opens files)."""
+    deadline = time.monotonic() + (REPLACE_RETRY_S if retry is None else retry)
+    while True:
+        try:
+            _os_replace(tmp, p)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+def _stage(p: Path, text: str) -> Path:
+    """Write text to a temporary file beside p, named for this run so two runs never share one. Returns its path."""
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-    os.replace(tmp, p)
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    return tmp
+
+
+def _write_atomic(p: Path, text: str, retry: float | None = None) -> None:
+    """Replace p with text in one step, or leave it as it was. The temporary file never outlives a failure."""
+    tmp = _stage(p, text)
+    try:
+        _replace(tmp, p, retry)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 def epic_status(mine: list[dict]) -> str:
@@ -630,7 +749,7 @@ def _save_locked(ledger: dict, root: Path, tracked) -> list[str]:
     sync_epic_status(ledger)
     snap = tracked[2] if tracked and tracked[1] == root else None
     want = {rel: _dump(obj) for rel, obj in split(ledger).items()}
-    changed, conflicts = [], []
+    changed, conflicts, was = [], [], {}
     for rel, text in want.items():
         p = root / rel
         on_disk = p.read_text(encoding="utf-8") if p.exists() else None
@@ -640,56 +759,89 @@ def _save_locked(ledger: dict, root: Path, tracked) -> list[str]:
         if snap is not None and on_disk != before:
             conflicts.append(rel)
         changed.append(rel)
+        was[rel] = on_disk
     if conflicts:
         raise LedgerConflict(f"another session changed {', '.join(conflicts)} after this command read the ledger; "
                              f"nothing was written. Run the command again (it reads the files afresh).")
-    for rel in changed:
-        _write_atomic(root / rel, want[rel])
-        if snap is not None:
+    # Every file is written to its temporary first, then each is swapped in. If one cannot be swapped in (another
+    # program holds it open past the retry), the files already swapped are put back, so a save that touches two files
+    # never lands half.
+    staged: list[tuple[str, Path]] = []
+    replaced: list[str] = []
+    try:
+        for rel in changed:
+            staged.append((rel, _stage(root / rel, want[rel])))
+        for rel, tmp in staged:
+            _replace(tmp, root / rel)
+            replaced.append(rel)
+    except OSError as e:
+        failed = next((rel for rel, _ in staged if rel not in replaced), "?")
+        unrestored = []
+        for rel in replaced:
+            try:
+                if was[rel] is None:
+                    (root / rel).unlink()
+                else:
+                    _write_atomic(root / rel, was[rel])
+            except OSError:
+                unrestored.append(rel)
+        for _, tmp in staged:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+        if unrestored:
+            raise LedgerError(f"could not write Docs/Ledger/{failed} ({e.strerror or e}), and could not put back "
+                              f"{', '.join(unrestored)}, which now hold this command's change: check them with the "
+                              f"version control's diff before going on")
+        raise LedgerError(f"could not write Docs/Ledger/{failed} ({e.strerror or e}): another program holds it open. "
+                          f"Nothing was saved; run the command again")
+    if snap is not None:
+        for rel in changed:
             snap[rel] = want[rel]
     return [f"Docs/Ledger/{rel}" for rel in changed]
 
 
 _LOCK_HELD: dict[tuple, int] = {}  # (lock path, thread) -> how deep that thread holds it (the lock is re-entrant)
+# The byte the lock is taken on, far past the holder note at the start of the file, so a waiting run can still read
+# the note (Windows locks are mandatory: a locked byte cannot be read by anyone else).
+_LOCK_BYTE = 1 << 30
 
 
-def pid_alive(pid: int) -> bool:
-    """True while a process with this id runs. On Windows os.kill(pid, 0) would terminate it, so ask the kernel."""
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-        from ctypes import wintypes
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.OpenProcess.restype = wintypes.HANDLE
-        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        k32.CloseHandle.argtypes = [wintypes.HANDLE]
-        h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-        if not h:
-            return ctypes.get_last_error() == 5  # access denied: it exists, it is just not ours to open
-        try:
-            code = wintypes.DWORD()
-            return not k32.GetExitCodeProcess(h, ctypes.byref(code)) or code.value == 259  # STILL_ACTIVE
-        finally:
-            k32.CloseHandle(h)
+def _try_os_lock(fd: int) -> bool:
+    """Take the operating system's lock on the lock file, without waiting. True when taken."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, _LOCK_BYTE, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
-    return True
+    except OSError:
+        return False
+
+
+def _os_unlock(fd: int) -> None:
+    with contextlib.suppress(OSError):
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, _LOCK_BYTE, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 @contextlib.contextmanager
 def ledger_lock(path: Path | None = None, wait: float | None = None):
     """Serialise every change to the ledger files.
 
-    The lock was taken over by age (a commit waiting on dv for five minutes lost
-    it) and removed by whoever finished, whatever it held. Now a lock is taken over only when the process it names has
-    exited, the takeover is a rename only one waiter can win, and a run removes only a lock that still holds its own
-    token. Re-entrant within one process: main() holds it for a changing command and save() takes it again."""
+    The lock is the operating system's lock on a file that is never deleted (msvcrt.locking on Windows, flock
+    elsewhere). The system frees it when the holding process ends, however it ends, so a crashed run cannot leave a
+    lock behind, and there is no takeover to race over. The holder writes a one-line note at the start of the file
+    (its process id, when, what it runs) for the message a waiting run prints. A run waits up to LOCK_WAIT_S for the
+    holder, then refuses. Re-entrant within one thread: main() holds it for a changing command and save() takes it
+    again. Two threads of one process (the website) each open the file, so they exclude each other too."""
     path = Path(path or LOCK)
     key = (os.path.normcase(str(path)), threading.get_ident())
     if _LOCK_HELD.get(key):
@@ -700,48 +852,34 @@ def ledger_lock(path: Path | None = None, wait: float | None = None):
             _LOCK_HELD[key] -= 1
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    token = f"{os.getpid()} {uuid.uuid4().hex} {datetime.now().isoformat(timespec='seconds')}\n"
-    deadline = time.monotonic() + (LOCK_WAIT_S if wait is None else wait)
-    while True:
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, token.encode())
-            os.close(fd)
-            break
-        except FileExistsError:
-            pass
-        try:
-            held = path.read_text(encoding="utf-8")
-        except (FileNotFoundError, PermissionError):
-            continue
-        try:
-            pid = int(held.split()[0])
-        except (ValueError, IndexError):
-            pid = None  # still being written: wait for it
-        if pid is not None and not pid_alive(pid):
-            tomb = path.with_name(f"{path.name}.dead-{uuid.uuid4().hex}")
-            try:
-                os.rename(path, tomb)
-            except (FileNotFoundError, FileExistsError, PermissionError):
-                continue
-            moved = tomb.read_text(encoding="utf-8")
-            if moved != held and not path.exists():
-                os.rename(tomb, path)  # it was a live run's new lock, not the dead one: put it back
-            else:
-                tomb.unlink()
-            continue
-        if time.monotonic() > deadline:
-            raise LedgerError(f"another ledger.py run holds {path} ({held.strip() or 'being written'}) and its process "
-                              f"is still running, so it is not taken over; try again when it finishes")
-        time.sleep(0.25)
-    _LOCK_HELD[key] = 1
+    for old in path.parent.glob(path.name + ".dead-*"):  # left by the lock this one replaced
+        with contextlib.suppress(OSError):
+            old.unlink()
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
-        yield
+        deadline = time.monotonic() + (LOCK_WAIT_S if wait is None else wait)
+        while not _try_os_lock(fd):
+            if time.monotonic() > deadline:
+                try:
+                    held = path.read_text(encoding="utf-8", errors="replace").strip()
+                except OSError:
+                    held = ""
+                raise LedgerError(f"another ledger.py run holds {path} ({held or 'no note'}) and is still running; "
+                                  f"the system frees the lock when it ends, so try again when it finishes")
+            time.sleep(0.1)
+        with contextlib.suppress(OSError):
+            note = f"pid {os.getpid()}, since {datetime.now().isoformat(timespec='seconds')}: {' '.join(sys.argv[1:3])}\n"
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, note.encode("utf-8", "replace"))
+        _LOCK_HELD[key] = 1
+        try:
+            yield
+        finally:
+            _LOCK_HELD.pop(key, None)
+            _os_unlock(fd)
     finally:
-        _LOCK_HELD.pop(key, None)
-        with contextlib.suppress(FileNotFoundError):
-            if path.read_text(encoding="utf-8") == token:
-                path.unlink()
+        os.close(fd)
 
 
 def index(ledger: dict) -> tuple[dict, dict, dict]:
@@ -756,6 +894,20 @@ def norm(p: str) -> str:
     while p.startswith("./"):
         p = p[2:]
     return p
+
+
+def audit_allowed(path: str, allowed: list[str]) -> bool:
+    """path_allowed, as the audit reads a commit. A version control lists every file of a committed folder and the new
+    folder itself, so a list entry that names a folder allows what is in it whether or not it ends in / (the tool adds
+    a folder named on the command line as it was written: 'Content/Art/Props/WreckPanel'), and a folder above an entry
+    is allowed (it holds nothing of its own). Run on a working ledger's 2237 commits, the stricter test flagged 34 commits made
+    through the tool."""
+    p = norm(path).rstrip("/")
+    for a in allowed:
+        a = norm(a).rstrip("/")
+        if a and (p == a or p.startswith(a + "/") or a.startswith(p + "/")):
+            return True
+    return False
 
 
 def path_allowed(path: str, allowed: list[str]) -> bool:
@@ -919,6 +1071,17 @@ def validate(ledger: dict) -> list[str]:
 
     epics, tasks, decisions = index(ledger)
 
+    # A field the tool does not know is refused: a misspelled 'dependOn' was accepted and ignored, and the task was
+    # listed READY while its real dependency was unfinished.
+    known = {"epics": EPIC_FIELDS, "tasks": TASK_FIELDS | {NEEDS_OWNER}, "decisions": DECISION_FIELDS}
+    for coll, fields in known.items():
+        for item in ledger[coll]:
+            for k in item:
+                if k not in fields:
+                    errs.append(f"{item.get('id', '?')}: unknown field '{k}' (a misspelling? the fields a "
+                                f"{coll[:-1]} may carry are listed in ledger.py, {coll[:-1].upper()}_FIELDS)")
+    waves = ledger.get("waves")
+
     for d in ledger["decisions"]:
         i = d["id"]
         if not RE_DECISION.match(i):
@@ -930,6 +1093,13 @@ def validate(ledger: dict) -> list[str]:
             errs.append(f"{i}: decision status '{d.get('status')}' not in {DECISION_STATUSES}")
         if d.get("status") == "decided" and not (d.get("ruling") and d.get("ruledOn")):
             errs.append(f"{i}: a decided decision needs 'ruling' and 'ruledOn'")
+        if d.get("ruledOn") and not date_ok(d["ruledOn"]):
+            errs.append(f"{i}: ruledOn '{d['ruledOn']}' is not a date (YYYY-MM-DD)")
+        for n, s in enumerate(d.get("superseded") or []):
+            if not (isinstance(s, dict) and s.get("ruling") and s.get("on")
+                    and len(str(s.get("why", "")).strip()) >= REASON_MIN):
+                errs.append(f"{i}: superseded entry {n + 1} needs the old 'ruling', 'on' and a 'why' of "
+                            f"{REASON_MIN}+ characters")
         # An open decision carries the choices the owner can pick on the website. Decided ones from
         # before this rule have none and need none.
         if d.get("status") == "open" or "options" in d:
@@ -1002,6 +1172,20 @@ def validate(ledger: dict) -> list[str]:
             errs.append(f"{i}: size '{t.get('size')}' not in {SIZES}")
         if t.get("status") not in STATUSES:
             errs.append(f"{i}: status '{t.get('status')}' not in {STATUSES}")
+        if "wave" in t and (not isinstance(t["wave"], int) or isinstance(t["wave"], bool)):
+            errs.append(f"{i}: wave '{t['wave']}' is a whole number")
+        elif waves is not None and "wave" in t and str(t["wave"]) not in waves:
+            errs.append(f"{i}: wave {t['wave']} is not in meta.json's waves table; name the wave there first "
+                        f"(add-plan can), or use one it has")
+        if "session" in t and not (isinstance(t["session"], str) and t["session"].strip()):
+            errs.append(f"{i}: session is the id of the Claude Code session that holds it")
+        for n, ed in enumerate(t.get("edits") or []):
+            if not (isinstance(ed, dict) and ed.get("on") and isinstance(ed.get("changed"), dict)
+                    and len(str(ed.get("reason", "")).strip()) >= REASON_MIN):
+                errs.append(f"{i}: edits entry {n + 1} needs 'on', 'changed' and a 'reason' of {REASON_MIN}+ characters")
+        for n, r in enumerate(t.get("reopened") or []):
+            if not (isinstance(r, dict) and r.get("on") and len(str(r.get("why", "")).strip()) >= REASON_MIN):
+                errs.append(f"{i}: reopened entry {n + 1} needs 'on' and a 'why' of {REASON_MIN}+ characters")
         # Owners come from the departments list, open tasks only: a finished task keeps the
         # free-text owner it was closed with.
         if depts is not None and t.get("status") not in FINISHED:
@@ -1071,6 +1255,7 @@ def validate(ledger: dict) -> list[str]:
                     errs.append(f"{i}: a finding is an object")
                     continue
                 n = f"{i}#{f.get('n')}"
+                errs.extend(f"{n}: unknown field '{k}' in a finding" for k in f if k not in FINDING_FIELDS)
                 if not isinstance(f.get("n"), int):
                     errs.append(f"{n}: a finding is numbered")
                 if f.get("severity") not in SEVERITIES:
@@ -1146,9 +1331,13 @@ def validate(ledger: dict) -> list[str]:
             visit(n, [])
 
     # a task may not depend on a task in a LATER wave
+    def wave_of(x: dict) -> int:
+        w = x.get("wave", 0)
+        return w if isinstance(w, int) else 0  # a wave that is not a number is refused above
+
     for t in ledger["tasks"]:
         for dep in t.get("dependsOn") or []:
-            if dep in tasks and tasks[dep].get("wave", 0) > t.get("wave", 0):
+            if dep in tasks and wave_of(tasks[dep]) > wave_of(t):
                 errs.append(f"{t['id']}: wave {t.get('wave')} depends on {dep} in later wave {tasks[dep].get('wave')}")
 
     for o in ledger.get("outsideCommits", []):
@@ -1225,6 +1414,32 @@ def release_blocked(ledger: dict) -> list[str]:
         cmd_note(ledger, t["id"], f"Released from blocked: {', '.join(f'{x} {id_state(ledger, x)}' for x in w)}.")
         out.append(t["id"])
     return out
+
+
+def date_ok(s) -> bool:
+    """True for a real calendar date written YYYY-MM-DD."""
+    try:
+        return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(s))) and bool(datetime.strptime(str(s), "%Y-%m-%d"))
+    except ValueError:
+        return False
+
+
+def current_session() -> str | None:
+    """The Claude Code session running this command, from the CLAUDE_CODE_SESSION_ID Claude Code sets in its shells
+    (it is the session's transcript name, and the session_id its hooks receive). None outside Claude Code."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    return sid or None
+
+
+def holder_text(t: dict) -> str:
+    """Who holds a task, in words, for `next`."""
+    if t.get("heldBy"):
+        return f"held by {t['heldBy']}"
+    return "no holder recorded" if not t.get("session") else f"held by session {t['session'][:8]}"
+
+
+def has_holder(t: dict) -> bool:
+    return bool(t.get("heldBy") or t.get("session"))
 
 
 def days_since(stamp: str | None) -> int | None:
@@ -1308,13 +1523,20 @@ def cmd_next(ledger: dict) -> int:
     # Every in-progress and blocked line carries its age, and every id a blocker names carries
     # that id's state now, so a blocker whose decision was answered reads as answered here, not as the owner's to do.
     for t in active:
-        print(f"  IN PROGRESS  {t['id']}  (wave {t['wave']})  {t['title']}  -- last touched {age_text(last_touched(t))}")
-    # In-progress tasks with no dated note were read
-    # as some other session's and walked past for later waves. Nobody held them. Say so where the list is read.
+        print(f"  IN PROGRESS  {t['id']}  (wave {t['wave']})  {t['title']}  -- {holder_text(t)}, last touched "
+              f"{age_text(last_touched(t))}")
+    # In-progress tasks with no dated note were read as some other session's and walked past for later waves. Nobody
+    # held them. Say so where the list is read. A task whose holder is recorded is that holder's: another session
+    # takes it only with `start --takeover`.
     stale_active = [t for t in active if "STALE?" in age_text(last_touched(t))]
-    if stale_active:
-        print(f"  -> {len(stale_active)} in-progress task(s) flagged STALE? are nobody's unless a dated note names who "
-              f"holds them: continue them, lowest wave first, BEFORE any later-wave READY task below.")
+    unheld = [t for t in stale_active if not has_holder(t)]
+    if unheld:
+        print(f"  -> {len(unheld)} in-progress task(s) flagged STALE? have no holder recorded, so they are nobody's: "
+              f"continue them (`start` records you as the holder), lowest wave first, BEFORE any later-wave READY "
+              f"task below.")
+    if len(stale_active) > len(unheld):
+        print(f"  -> {len(stale_active) - len(unheld)} STALE? task(s) are held by another session: theirs, unless that "
+              f"session is gone - then `start <id> --takeover \"<why>\"`.")
     for t in blocked:
         w = t.get("waitsOn") or []
         named = list(dict.fromkeys(w + RE_ANY_ID.findall(t["blockedOn"])))
@@ -1343,14 +1565,17 @@ def cmd_next(ledger: dict) -> int:
         print("Also ready in later waves (their dependencies are met):")
         for t in later:
             print(f"  READY        {t['id']}  (wave {t['wave']})  {t['title']}{sent_by(t)}")
-    open_ = [d for d in ledger["decisions"] if d["status"] == "open"]
+    # A decision the owner has already answered on the website is waiting to be applied (listed first, above), not a
+    # question to ask again: a session reading only the last lines asked it a second time.
+    answered = {d["id"] for d, _ in waiting}
+    open_ = [d for d in ledger["decisions"] if d["status"] == "open" and d["id"] not in answered]
     if open_:
         gating = {}
         for t in ledger["tasks"]:
             for dep in t.get("dependsOn") or []:
                 if dep in decisions:
                     gating.setdefault(dep, []).append(t)
-        first = sorted(open_, key=lambda d: min([x["wave"] for x in gating.get(d["id"], [])] or [99]))[0]
+        first = sorted(open_, key=lambda d: min([x["wave"] for x in gating.get(d["id"], [])] or [10 ** 9]))[0]
         waves = sorted({x["wave"] for x in gating.get(first["id"], [])})
         print(f"Next decision for {OWNER}: {first['id']} - {first['question']}")
         print(f"  Recommended: {first['recommendation']}")
@@ -1382,11 +1607,30 @@ def cmd_show(ledger: dict, ident: str) -> int:
 
 # --------------------------------------------------------------------------- status changes
 
-def set_status(ledger: dict, ident: str, status: str, **extra) -> list[str]:
+def move_errors(t: dict, status: str) -> list[str]:
+    """Why a task's status may not make this move (MOVES), with what to run instead."""
+    old = t.get("status")
+    if status in MOVES.get(old, set()):
+        return []
+    if old in FINISHED and status == "in-progress":
+        return [f"{t['id']} is {old}: it comes back only with `start {t['id']} --reopen \"<why>\"`, which clears its "
+                f"evidence and landed commit and keeps them in its history"]
+    if old == "planned" and status == "done":
+        return [f"{t['id']} was never started: `start {t['id']}` first (it records who holds it), then done"]
+    if old == "blocked" and status == "done":
+        return [f"{t['id']} is blocked: `start {t['id']}` once the blocker is gone, then done"]
+    return [f"{t['id']} is {old}: it cannot move to {status}"]
+
+
+def set_status(ledger: dict, ident: str, status: str, reopen: bool = False, **extra) -> list[str]:
     _, tasks, decisions = index(ledger)
     t = tasks.get(ident)
     if not t:
         return [f"unknown task {ident}"]
+    if not reopen:
+        errs = move_errors(t, status)
+        if errs:
+            return errs
     trial = copy.deepcopy(ledger)
     tt = index(trial)[1][ident]
     tt["status"] = status
@@ -1448,7 +1692,188 @@ def block_errors(ledger: dict, ident: str, on: str | None, until: list[str] | No
     return errs
 
 
-def cmd_decide(ledger: dict, ident: str, ruling: str, by: str, date: str) -> list[str]:
+def overlaps(a: str, b: str) -> bool:
+    """True when two files-list entries can name the same file: equal, or one is a folder holding the other."""
+    a, b = norm(a), norm(b)
+    return a == b or (a.endswith("/") and b.startswith(a)) or (b.endswith("/") and a.startswith(b))
+
+
+def shared_entries(ledger: dict, t: dict) -> dict[str, list[str]]:
+    """Each of a task's files entries that another open task can also edit: {entry: [the other tasks' ids]}."""
+    out: dict[str, list[str]] = {}
+    for f in t.get("files") or []:
+        others = [x["id"] for x in ledger["tasks"] if x["id"] != t["id"] and x["status"] not in FINISHED
+                  and any(overlaps(f, g) for g in x.get("files") or [])]
+        if others:
+            out[f] = others
+    return out
+
+
+def files_ever(t: dict) -> list[str]:
+    """Every files list entry the task has held: its list now, plus what edit-task or start --files narrowed away. A
+    commit made while an entry was on the list stays inside the task's files for the audit."""
+    out = list(t.get("files") or [])
+    for ed in t.get("edits") or []:
+        before = ((ed.get("changed") or {}).get("files") or [None])[0] if isinstance(ed, dict) else None
+        out += [f for f in before or [] if f not in out]
+    return out
+
+
+def edit_record(t: dict, changed: dict, reason: str, by: str | None = None) -> None:
+    """Append one edit to the task's history: {on, by, reason, changed: {field: [before, after]}}."""
+    entry = {"on": stamp_now(), "reason": reason.strip(), "changed": changed}
+    if by:
+        entry["by"] = by
+    t.setdefault("edits", []).append(entry)
+
+
+def narrow_errors(old: list[str], new: list[str]) -> list[str]:
+    """Why a files list cannot be narrowed to this one: every new entry lies inside an entry of the old list."""
+    if not new:
+        return ["--files names at least one path"]
+
+    def inside(f: str, o: str) -> bool:
+        f, o = norm(f), norm(o)
+        return f == o or (o.endswith("/") and f.startswith(o))
+
+    wider = [f for f in new if not any(inside(f, o) for o in old)]
+    return [f"--files can only narrow the list at start; not inside it: {wider} (to widen it, commit with --reason, or "
+            f"edit-task)"] if wider else []
+
+
+def cmd_start(ledger: dict, ident: str, by: str | None, session: str | None = None, takeover: str | None = None,
+              reopen: str | None = None, files: list[str] | None = None) -> tuple[list[str], list[str]]:
+    """Start a task, or re-claim one. Returns (errors, lines to print).
+
+    Nothing claimed a task: `start` on a task in progress under another session passed silently and replaced its
+    holder, `done` passed on a task never started, and `start` on a done task reopened it with its old evidence. Now
+    `start` records the holder (--by, else this Claude Code session), refuses a task another holder has unless
+    --takeover says why, and brings a done or withdrawn task back only with --reopen, which clears its evidence."""
+    t = index(ledger)[1].get(ident)
+    if not t:
+        return [f"unknown task {ident}"], []
+    if is_subtask(t):
+        errs = start_errors(ledger, ident, by)
+        if errs:
+            return errs, []
+        return set_status(ledger, ident, "in-progress", heldBy=by.strip()), []
+    by = (by or "").strip() or None
+    session = (session or "").strip() or None
+    me = by or (f"session {session[:8]}" if session else None)
+    lines: list[str] = []
+    st = t["status"]
+    extra: dict = {"heldBy": me, "session": session}
+    if st in FINISHED:
+        if len((reopen or "").strip()) < REASON_MIN:
+            return move_errors(t, "in-progress") + ([f"--reopen needs a reason of at least {REASON_MIN} characters"]
+                                                    if reopen else []), []
+        trial = copy.deepcopy(ledger)
+        tt = index(trial)[1][ident]
+        tt.setdefault("reopened", []).append({k: v for k, v in {
+            "on": stamp_now(), "why": reopen.strip(), "by": me, "was": st,
+            "evidence": tt.pop("evidence", None), "landed": tt.pop("landed", None)}.items() if v is not None})
+        errs = set_status(trial, ident, "in-progress", reopen=True, **extra)
+        if errs:
+            return errs, []
+        cmd_note(trial, ident, f"Reopened by {me or 'an unnamed run'}: {reopen.strip()}")
+        ledger.clear()
+        ledger.update(trial)
+        t = index(ledger)[1][ident]
+        lines.append(f"{ident} reopened: its evidence and landed commit moved to its 'reopened' history")
+    elif st == "in-progress":
+        same = (session and t.get("session") == session) or (not session and me and t.get("heldBy") == me) \
+            or (session and not t.get("session") and me and t.get("heldBy") == me)
+        if same:
+            lines.append(f"{ident} is already in progress under you ({holder_text(t)}); nothing changed")
+            if not files:
+                return [], lines
+        elif has_holder(t):
+            if len((takeover or "").strip()) < REASON_MIN:
+                return [f"{ident} is in progress, {holder_text(t)} (started {t.get('startedAt', '?')}). It is that "
+                        f"session's: if that session is gone, take it over with --takeover \"<why>\" "
+                        f"({REASON_MIN}+ characters), and the takeover is noted"], []
+            cmd_note(ledger, ident, f"Taken over from {holder_text(t)[8:]} by {me or 'an unnamed run'}: "
+                                    f"{takeover.strip()}")
+            for k in ("heldBy", "session"):
+                t.pop(k, None)
+            t.update({k: v for k, v in extra.items() if v})
+            lines.append(f"{ident} taken over; the note says from whom and why")
+        else:
+            t.update({k: v for k, v in extra.items() if v})
+            lines.append(f"{ident} had no holder recorded; it is now {holder_text(t)}")
+    else:
+        errs = set_status(ledger, ident, "in-progress", **extra)
+        if errs:
+            return errs, []
+        t = index(ledger)[1][ident]
+        if not me:
+            lines.append(f"{ident}: no holder recorded (no --by, and not run from a Claude Code session)")
+    if files:
+        new = [norm(f) for f in files]
+        errs = narrow_errors(t.get("files") or [], new)
+        if errs:
+            return errs, []
+        if new != t.get("files"):
+            edit_record(t, {"files": [list(t.get("files") or []), new]}, "narrowed at start (start --files)", me)
+            t["files"] = new
+            lines.append(f"{ident}: files narrowed to {', '.join(new)}")
+    shared = shared_entries(ledger, t)
+    if shared:
+        lines.append(f"{ident} shares files entries with other open tasks (a commit by either can touch the same file; "
+                     f"narrow with `start {ident} --files <paths>`):")
+        for f, others in shared.items():
+            lines.append(f"    {f}  also on {', '.join(others[:8])}" + (f" and {len(others) - 8} more" if len(others) > 8 else ""))
+    return [], lines
+
+
+def done_errors(ledger: dict, ident: str, evidence: str | None) -> list[str]:
+    """Why `done` cannot close this task: a subtask is confirmed by the hub, and evidence starts with its label."""
+    t = index(ledger)[1].get(ident)
+    if not t:
+        return [f"unknown task {ident}"]
+    if is_subtask(t):
+        return [f"{ident} is a department subtask: its agent hands it in with `submit`, and the hub's `confirm` "
+                f"marks it done"]
+    if not RE_EVIDENCE_LABEL.match(evidence or ""):
+        return [f"{ident}: evidence starts with its label - {', '.join(EVIDENCE_LABELS)} - then says what was "
+                f"observed: --evidence \"ran-it: <what ran and what it showed>\""]
+    return []
+
+
+def cmd_edit_task(ledger: dict, ident: str, reason: str, changes: dict, by: str | None = None) -> list[str]:
+    """Change an unfinished task's title, wave, dependsOn, files or acceptance, recording each change and why in its
+    'edits'. Plans used to change through scripts that wrote the JSON, with nothing in the ledger saying so."""
+    t = index(ledger)[1].get(ident)
+    if not t:
+        return [f"unknown task {ident}"]
+    if t["status"] in FINISHED:
+        return [f"{ident} is {t['status']}: a finished task's record stays as it was closed"]
+    if len((reason or "").strip()) < REASON_MIN:
+        return [f"edit-task needs --reason of at least {REASON_MIN} characters"]
+    bad = [k for k in changes if k not in EDITABLE]
+    if bad:
+        return [f"edit-task changes only {', '.join(EDITABLE)}, not {', '.join(bad)}"]
+    changed = {k: [copy.deepcopy(t.get(k)), v] for k, v in changes.items() if t.get(k) != v}
+    if not changed:
+        return [f"{ident}: nothing to change (the values given are the ones it has)"]
+    trial = copy.deepcopy(ledger)
+    tt = index(trial)[1][ident]
+    for k, (_, v) in changed.items():
+        if v in (None, []) and k == "dependsOn":
+            tt.pop(k, None)
+        else:
+            tt[k] = v
+    edit_record(tt, changed, reason, by)
+    errs = [e for e in validate(trial) if e.startswith(ident + ":") or e.startswith(ident + "#")]
+    if errs:
+        return errs
+    ledger.clear()
+    ledger.update(trial)
+    return []
+
+
+def cmd_decide(ledger: dict, ident: str, ruling: str, by: str, date: str, supersede: str | None = None,
+               via: str = "chat") -> list[str]:
     _, _, decisions = index(ledger)
     d = decisions.get(ident)
     if not d:
@@ -1456,10 +1881,27 @@ def cmd_decide(ledger: dict, ident: str, ruling: str, by: str, date: str) -> lis
     # --by defaulted to the owner, so anything could record a ruling in the owner's name.
     if not (by or "").strip():
         return [f"{ident}: decide names who ruled, with --by ({OWNER}'s website answers go through apply instead)"]
+    if not (ruling or "").strip():
+        return [f"{ident}: decide needs the ruling's text"]
+    # A date that is not one passed validate, and a ruling in the future is a typo.
+    if not date_ok(date):
+        return [f"{ident}: --date '{date}' is not a date; write YYYY-MM-DD"]
+    if date > datetime.now().strftime("%Y-%m-%d"):
+        return [f"{ident}: --date {date} is in the future"]
+    # A second decide overwrote the ruling, its name and its date without a word.
+    if d.get("status") == "decided":
+        if len((supersede or "").strip()) < REASON_MIN:
+            return [f"{ident} is already decided ({d.get('ruledBy', '?')}, {d.get('ruledOn', '?')}): a new ruling "
+                    f"replaces it only with --supersede \"<why>\" ({REASON_MIN}+ characters); the old one is kept"]
+        d.setdefault("superseded", []).append({k: v for k, v in {
+            "ruling": d.get("ruling"), "ruledBy": d.get("ruledBy"), "ruledOn": d.get("ruledOn"),
+            "ruledVia": d.get("ruledVia"), "chosen": d.pop("chosen", None), "why": supersede.strip(),
+            "on": datetime.now().strftime("%Y-%m-%d")}.items() if v is not None})
     d["status"] = "decided"
     d["ruling"] = ruling
     d["ruledBy"] = by
     d["ruledOn"] = date
+    d["ruledVia"] = via
     return []
 
 
@@ -1477,11 +1919,10 @@ def cmd_apply(ledger: dict, ident: str, answers: dict) -> list[str]:
     errs = answer_errors(d, str(ans.get("choice", "")), str(ans.get("text", "")))
     if errs:
         return [f"{ident}: the answer on file cannot be applied: {e}" for e in errs]
-    errs = cmd_decide(ledger, ident, answer_ruling(d, ans), OWNER, str(ans.get("answeredAt", ""))[:10])
+    errs = cmd_decide(ledger, ident, answer_ruling(d, ans), OWNER, str(ans.get("answeredAt", ""))[:10], via="website")
     if errs:
         return errs
     d["chosen"] = ans["choice"]
-    d["ruledVia"] = "website"
     if str(ans.get("note", "")).strip():
         d["note"] = ans["note"].strip()
     return []
@@ -1501,8 +1942,10 @@ def dump_command(ident: str) -> str:
     """What dumps a review's Blueprint graphs inside the running editor (Docs/Ledger/review_graph_dump.py): Python
     run in the editor, from its Output Log (Python mode) or over Unreal's remote execution."""
     script = (HERE / "review_graph_dump.py").as_posix()
-    return (f"in the editor's Python: exec(open(r'{script}', encoding='utf-8').read()); "
-            f"run('{ident}')")
+    code = f"exec(open(r'{script}', encoding='utf-8').read()); run('{ident}')"
+    if EDITOR_PYTHON:  # ledger_config.json names the command that runs Python in the open editor
+        return f"{EDITOR_PYTHON} \"{code}\""
+    return f"in the editor's Python: {code}"
 
 
 def covered_files(ledger: dict, covers: list[str]) -> list[str]:
@@ -1583,8 +2026,9 @@ def unmet_for_dispatch(ledger: dict, t: dict) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def dispatch_prompt(ledger: dict, t: dict, dept: dict) -> str:
-    """The agent's whole brief, written from the task so nobody retells it from memory."""
+def dispatch_prompt(ledger: dict, t: dict, dept: dict, dirty: list[str] | None = None) -> str:
+    """The agent's whole brief, written from the task so nobody retells it from memory. dirty: the covered files that
+    had uncommitted changes when it was dispatched (with --dirty-ok)."""
     tasks = index(ledger)[1]
     name = f"{t['owner']} agent"
     L = [f"You are the {name}, working ledger task {t['id']}, a {t['kind']} subtask: {t['title']}",
@@ -1593,7 +2037,14 @@ def dispatch_prompt(ledger: dict, t: dict, dept: dict) -> str:
          f"    python Docs/Ledger/ledger.py show {t['id']}", ""]
     covers = t.get("covers") or []
     if covers:
-        L.append(f"What this {t['kind']} covers. Read these files at their landed commits; edit nothing:")
+        # The prompt said "at their landed commits", but Diversion has no command that prints a file as of a commit, so
+        # an agent read the working copy, other sessions' uncommitted edits included. dispatch now checks the working
+        # copy instead, and the prompt says what is read.
+        dirty = dirty or []
+        L.append(f"What this {t['kind']} covers. Read these files as they stand in the working copy; edit nothing. "
+                 + ("At dispatch none of them had uncommitted changes, so the working copy is what landed:"
+                    if not dirty else "At dispatch these had uncommitted changes, so judge the code, and say in a "
+                    f"finding's text when a line you cite may be someone's unfinished edit: {', '.join(dirty)}"))
         for c in covers:
             ct = tasks.get(c, {})
             L.append(f"  {c} {ct.get('title', '')} (landed {ct.get('landed', 'not landed')})")
@@ -1635,8 +2086,21 @@ def dispatch_prompt(ledger: dict, t: dict, dept: dict) -> str:
     return "\n".join(L)
 
 
+def uncommitted(files: list[str]) -> list[str]:
+    """The files under these files-list entries that have uncommitted changes, from the version control. Raises
+    RuntimeError when it cannot be asked. The selftest replaces it (UNCOMMITTED) with a stand-in."""
+    out: list[str] = []
+    for f in dict.fromkeys(norm(x) for x in files):
+        out += [p for p in changed_paths(f.rstrip("/") or ".") if overlaps(f, p) and p not in out]
+    return out
+
+
+UNCOMMITTED = uncommitted
+
+
 def cmd_dispatch(ledger: dict, ident: str, by: str | None, dump: str | None,
-                 restart: bool) -> tuple[list[str], dict | None]:
+                 restart: bool, dirty_ok: str | None = None,
+                 session: str | None = None) -> tuple[list[str], dict | None]:
     """Freeze what a subtask covers, record who sent it, and return the agent to start and its prompt."""
     t = index(ledger)[1].get(ident)
     if not t:
@@ -1677,15 +2141,31 @@ def cmd_dispatch(ledger: dict, ident: str, by: str | None, dump: str | None,
         errs = dump_errors(REPO / folder, ident, covers)
         if errs:
             return [f"{ident}: {errs[0]}:\n      {dump_command(ident)}"], None
+    dirty: list[str] = []
+    if t["kind"] == "review" and covers:
+        try:
+            dirty = UNCOMMITTED(covered_files(ledger, covers))
+        except (RuntimeError, OSError) as e:
+            return [f"{ident}: could not ask {VCS.name} which covered files have uncommitted changes ({e}); a review "
+                    f"reads the working copy, so dispatch checks it first"], None
+        if dirty and len((dirty_ok or "").strip()) < REASON_MIN:
+            shown = ", ".join(dirty[:10]) + (f" and {len(dirty) - 10} more" if len(dirty) > 10 else "")
+            return [f"{ident}: covered files have uncommitted changes, and the agent reads the working copy, not the "
+                    f"landed commits: {shown}. Commit or wait for them, or dispatch with --dirty-ok \"<why>\" "
+                    f"({REASON_MIN}+ characters) and the prompt names them"], None
     t["covers"] = covers
     t["dispatchedAt"] = stamp_now()
     t["dispatchedBy"] = by.strip()
+    if session:
+        t["dispatchedSession"] = session
     if folder:
         t["dump"] = norm(folder)
+    if dirty:
+        cmd_note(ledger, ident, f"Dispatched with uncommitted changes in {', '.join(dirty[:20])}: {dirty_ok.strip()}")
     if restart and st != "planned":
         cmd_note(ledger, ident, f"Restarted by {by.strip()}: a new {dept['agent']} agent is started on this task; the "
                                 f"findings already recorded stay.")
-    return [], {"agent": dept["agent"], "background": t["kind"] == "review", "prompt": dispatch_prompt(ledger, t, dept)}
+    return [], {"agent": dept["agent"], "background": t["kind"] == "review", "prompt": dispatch_prompt(ledger, t, dept, dirty)}
 
 
 def start_errors(ledger: dict, ident: str, by: str | None) -> list[str]:
@@ -2042,8 +2522,28 @@ def render_check(ledger: dict | None = None) -> list[str]:
     return []
 
 
-def write_render(ledger: dict | None = None) -> None:
-    _write_atomic(LEDGER_MD, render(_on_disk(ledger)))
+def write_render(ledger: dict | None = None, required: bool = False) -> bool:
+    """Write LEDGER.md from the files. A command that has already saved the ledger does not fail on this: when another
+    program holds LEDGER.md open past the retry, it says the change is saved and LEDGER.md is behind (the next render,
+    by any command, catches it up), rather than end in a traceback after the save. `render` itself passes
+    required=True and refuses."""
+    try:
+        _write_atomic(LEDGER_MD, render(_on_disk(ledger)), min(RENDER_RETRY_S, REPLACE_RETRY_S))
+        return True
+    except OSError as e:
+        msg = (f"{LEDGER_MD_REL} could not be written ({e.strerror or e}; another program holds it open), so it is "
+               f"behind the ledger files. Run `python Docs/Ledger/ledger.py render` to catch it up")
+        if required:
+            raise LedgerError(msg)
+        print(f"WARNING: the change is saved, but {msg}", file=sys.stderr)
+        return False
+
+
+def persist(ledger: dict) -> str:
+    """save() then write_render(), in words for the command's last line."""
+    wrote = save(ledger)
+    saved = f"saved {', '.join(wrote) or 'nothing new'}"
+    return f"{saved} and re-rendered" if write_render(ledger) else f"{saved}; LEDGER.md is behind (run render)"
 
 
 # --------------------------------------------------------------------------- commit rules (pure)
@@ -2086,7 +2586,13 @@ def check_commit(ledger: dict, message: str, role: str | None, reason: str | Non
     paths = [norm(p) for p in paths]
     if not paths:
         errs.append("no paths given; paths are explicit and there is no -a")
-    roles = role_lines(message) + ([role] if role else [])
+    # A Role line typed into the message file passed with no --role and no --reason, and then no path rule applied.
+    # The role comes from the flag only; the tool writes the Role and Reason lines itself.
+    typed = role_lines(message)
+    if typed:
+        errs.append(f"the message file carries a 'Role: {typed[0]}' line; name the role with --role and say why with "
+                    f"--reason (the tool writes both lines)")
+    roles = [role] if role else []
     for r in roles:
         if r not in ROLES:
             errs.append(f"role '{r}' is not one of {ROLES}")
@@ -2147,6 +2653,11 @@ def judge_commits(ledger: dict, commits: list[dict]) -> tuple[list[str], list[st
         bad_roles = [r for r in roles if r not in ROLES]
         if bad_roles:
             errs.append(f"{c['id']}: carries role(s) {bad_roles} that are not in {ROLES}")
+        # The tool writes a Reason line under every Role line; a Role line without one was typed by hand into a commit
+        # made outside the tool, and would excuse the commit from every path rule.
+        if roles and not any(len(r) >= REASON_MIN for r in RE_REASON_LINE.findall(c.get("message", ""))):
+            errs.append(f"{c['id']}: carries 'Role: {roles[0]}' with no 'Reason:' line of {REASON_MIN}+ characters; a "
+                        f"role commit made through ledger.py always has one")
         if ident:
             in_scope.append(c["id"])
             if RE_TASK.match(ident):
@@ -2155,8 +2666,21 @@ def judge_commits(ledger: dict, commits: list[dict]) -> tuple[list[str], list[st
                     errs.append(f"{c['id']}: names unknown task {ident}")
                 elif t["status"] == "planned":
                     errs.append(f"{c['id']}: names {ident}, which is still planned")
+                elif not roles:
+                    # A commit made with the version control directly, naming a task, carried any file it liked.
+                    outside = [p for p in c.get("paths", []) if not is_ledger_file(p)
+                               and not audit_allowed(p, files_ever(t))]
+                    if outside:
+                        errs.append(f"{c['id']}: names {ident} but changed paths outside its files list: "
+                                    f"{outside[:5]}" + (f" and {len(outside) - 5} more" if len(outside) > 5 else ""))
             elif ident not in epics:
                 errs.append(f"{c['id']}: names unknown epic {ident}")
+            elif not roles:
+                allowed = [f for t in ledger["tasks"] if t["epic"] == ident for f in files_ever(t)]
+                outside = [p for p in c.get("paths", []) if not is_ledger_file(p) and not audit_allowed(p, allowed)]
+                if outside:
+                    errs.append(f"{c['id']}: names epic {ident} but changed paths outside every file list in it: "
+                                f"{outside[:5]}" + (f" and {len(outside) - 5} more" if len(outside) > 5 else ""))
             continue
         if roles and not bad_roles:
             in_scope.append(c["id"])
@@ -2214,12 +2738,17 @@ def parse_log(text: str) -> list[dict]:
     return VCS.parse_log(text)
 
 
+def renamed_to(p: str) -> str:
+    """A rename as Diversion lists it, 'old -> new', is the path it now has."""
+    return norm(p.split(" -> ")[-1])
+
+
 def commit_paths(cid: str, cache: dict | None = None) -> list[str]:
     """The paths a commit changed. A commit never changes, so `cache` (the audit's, kept in PATHS_CACHE) is
     trusted once filled."""
     if cache is not None and cid in cache:
-        return cache[cid]
-    paths = VCS.commit_paths(cid)
+        return [renamed_to(p) for p in cache[cid]]
+    paths = [renamed_to(p) for p in VCS.commit_paths(cid)]
     if cache is not None:
         cache[cid] = paths
     return paths
@@ -2392,7 +2921,7 @@ def do_commit(ledger: dict, message: str, role: str | None, reason: str | None, 
 def _fixture() -> dict:
     return {
         "schema": "example.ledger", "schemaVersion": 1, "title": "t", "auditFrom": "dv.commit.10",
-        "gates": {"g": "x"}, "conventions": {"c": "x"}, "waves": {"1": "a"}, "outsideCommits": [],
+        "gates": {"g": "x"}, "conventions": {"c": "x"}, "waves": {"1": "a", "2": "b"}, "outsideCommits": [],
         "departments": [{"name": "Engineering", "hub": True, "agent": None, "does": "files and hands out", "editor": "owns"},
                         {"name": "Security Department", "agent": None, "does": "reviews", "editor": "none"}],
         "decisions": [{"id": "PR-D01", "epic": "PR-E01", "question": "q", "recommendation": "r", "status": "open",
@@ -2424,11 +2953,14 @@ def selftest() -> int:
     settings (SELFTEST_PROFILE), so the checks run under those whatever this project's config says; a made-up project's
     settings are checked near the end. The project's own config is put back after."""
     saved = dict(CONFIG)
+    saved_uncommitted = UNCOMMITTED
     apply_config(SELFTEST_PROFILE)
+    globals()["UNCOMMITTED"] = lambda files: []  # no version control is asked; checks that need it set their own
     try:
         return _selftest()
     finally:
         apply_config(saved)
+        globals()["UNCOMMITTED"] = saved_uncommitted
 
 
 def _selftest() -> int:
@@ -2502,8 +3034,13 @@ def _selftest() -> int:
            True, "still planned")
     expect("path outside the task's files", check_commit(base, "PR-E01.01 x", None, None, ["Source/Z.cpp"]),
            True, "outside the task")
-    expect("role line in the message that is not a role",
-           check_commit(base, "x\n\nRole: Audio", None, None, ok_paths), True, "not one of")
+    expect("a Role line typed into the message file (the role comes from --role only)",
+           check_commit(base, "x\n\nRole: Checkpoint", None, None, ok_paths), True, "carries a 'Role: Checkpoint' line")
+    expect("the same with --role and a reason too",
+           check_commit(base, "x\n\nRole: Checkpoint", "Checkpoint", "full checkpoint at owner request", ok_paths),
+           True, "carries a 'Role")
+    expect("a --role that is not a role", check_commit(base, "x", "Audio", "a reason long enough here", ok_paths), True,
+           "not one of")
     expect("role without a reason", check_commit(base, "x", "Checkpoint", "", ok_paths), True, "reason")
     expect("role commit with a reason (control)",
            check_commit(base, "Checkpoint everything", "Checkpoint", "full checkpoint at owner request", ["Any/Path"]),
@@ -2520,7 +3057,8 @@ def _selftest() -> int:
     commits = [
         {"id": "dv.commit.14", "subject": "unrelated art", "message": "unrelated art", "paths": ["Content/Art/X.uasset"]},
         {"id": "dv.commit.13", "subject": "PR-E01.01 work", "message": "PR-E01.01 work", "paths": ["Source/A.cpp"]},
-        {"id": "dv.commit.12", "subject": "Checkpoint", "message": "Checkpoint\n\nRole: Checkpoint", "paths": ["Source/A.cpp"]},
+        {"id": "dv.commit.12", "subject": "Checkpoint", "message": "Checkpoint\n\nRole: Checkpoint\nReason: a full "
+         "checkpoint for the owner", "paths": ["Source/A.cpp"]},
         {"id": "dv.commit.11", "subject": "tweak", "message": "tweak", "paths": ["Content/Dir/Y.uasset"]},
     ]
     errs, ins, outs = judge_commits(base, commits)
@@ -3125,38 +3663,74 @@ def _selftest() -> int:
                 except LedgerError as e:
                     return [str(e)]
 
-            LOCK.write_text(f"{os.getpid()} someone-else 2000-01-01T00:00:00\n", encoding="utf-8")
-            expect("a lock whose holder still runs is not taken over, however old", try_lock(), True, "still running")
-            gone = subprocess.Popen([sys.executable, "-c", "pass"])
-            gone.wait()
-            LOCK.write_text(f"{gone.pid} crashed-run 2026-10-18T00:00:00\n", encoding="utf-8")
-            expect("a lock whose holder has exited is taken over (control)",
-                   try_lock() or ([] if not LOCK.exists() else ["lock left behind"]), False)
-            with ledger_lock(wait=0.3):
-                LOCK.write_text(f"{os.getpid()} another-runs-token x\n", encoding="utf-8")
-            ok = LOCK.exists() and "another-runs-token" in LOCK.read_text(encoding="utf-8")
-            expect("a run leaves alone a lock that no longer holds its own token (control)", [] if ok else ["removed it"], False)
-            LOCK.unlink()
+            def holder(path: Path):
+                """Another process that takes the lock on path and keeps it until it is killed."""
+                code = (f"import sys, time; sys.path.insert(0, {str(HERE)!r}); import ledger\n"
+                        f"with ledger.ledger_lock(ledger.Path({str(path)!r}), wait=5):\n"
+                        f"    print('held', flush=True); time.sleep(60)\n")
+                proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+                return proc, proc.stdout.readline().strip() == "held"
+
+            # The old lock file named a process id; a crashed run's file, whose id now belonged to another program,
+            # made every command wait 30 seconds and refuse. The system's own lock dies with its process.
+            LOCK.write_text("4242 an old run's lock file 2026-01-01T00:00:00\n", encoding="utf-8")
+            expect("an old lock file nobody holds does not block (control)", try_lock(), False)
+            proc, held = holder(LOCK)
+            try:
+                errs = try_lock() if held else ["the other process never took the lock"]
+                expect("a lock another process holds is not taken, and the refusal names the holder", errs, True,
+                       "still running")
+                expect("the refusal quotes the holder's note (control)",
+                       [] if any(f"pid {proc.pid}" in e for e in errs) else [f"errs={errs}"], False)
+            finally:
+                proc.kill()
+                proc.wait()
+            expect("a holder that dies without letting go leaves no lock behind (control)", try_lock(), False)
             with ledger_lock(wait=0.3):
                 inner = try_lock(0.3)
-            expect("the lock is re-entrant within one run (control)", inner or ([] if not LOCK.exists() else ["left"]), False)
+            expect("the lock is re-entrant within one thread (control)", inner, False)
+            got: list = []
+            with ledger_lock(wait=0.3):
+                th = threading.Thread(target=lambda: got.extend(try_lock(0.3)))
+                th.start()
+                th.join()
+            expect("another thread of the same process waits for it (the website's threads)", got, True, "still running")
+            expect("the lock file stays, and no .dead file is left (control)",
+                   [] if LOCK.exists() and not list(LOCK.parent.glob("*.dead-*")) else ["files"], False)
             root = Path(tmp) / "root"
             f = _fixture()
             save(f, root)
-            (root / ".ledger.lock").write_text(f"{os.getpid()} a-live-other-run x\n", encoding="utf-8")
             saved_wait = LOCK_WAIT_S
             globals()["LOCK_WAIT_S"] = 0.3
+            proc, held = holder(root / ".ledger.lock")
             try:
                 index(f)[1]["PR-E01.01"]["notes"] = "changed"
                 try:
                     save(f, root)
-                    errs = []
+                    errs = [] if held else ["the other process never took the lock"]
                 except LedgerError as e:
                     errs = [str(e)]
             finally:
                 globals()["LOCK_WAIT_S"] = saved_wait
+                proc.kill()
+                proc.wait()
             expect("save() waits for the lock another run holds, and refuses rather than write around it", errs, True,
                    "still running")
+            # R04: an answer waiting on the website is not asked again as the next decision.
+            f = _fixture()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cmd_next(f)
+            ok = "Next decision for Sam: PR-D01" in buf.getvalue()
+            expect("next asks an open decision nobody has answered (control)", [] if ok else [buf.getvalue()[-300:]], False)
+            save_answers({"PR-D01": {"choice": "Yes", "answeredAt": "2026-10-12 10:45"}})
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cmd_next(f)
+            ok = "ANSWERED     PR-D01" in buf.getvalue() and "Next decision" not in buf.getvalue()
+            expect("next does not ask again a decision answered on the website and waiting to be applied",
+                   [] if ok else [buf.getvalue()[-400:]], False)
+            ANSWERS_JSON.unlink()
             save_answers({"PR-D01": {"choice": "Yes"}, "PR-D02": {"choice": "No"}})
             stale = load_answers()  # what apply read before it saved the ledger
             save_answers({**stale, "PR-D03": {"choice": "Later"}})  # the website files another answer meanwhile
@@ -3174,6 +3748,9 @@ def _selftest() -> int:
         finally:
             LOCK, ANSWERS_JSON = saved_lock, saved_answers
 
+    _selftest_review_fixes(expect)
+    _selftest_hooks(expect)
+
     print("project config: the settings that tie the tool to one project:")
     good = dict(SELFTEST_PROFILE)
     expect("the fixtures' settings (control)", config_errors(good), False)
@@ -3186,6 +3763,17 @@ def _selftest() -> int:
     expect("a version control with no backend", config_errors({**good, "vcs": "perforce"}), True, "no backend")
     expect("unreal written as a word", config_errors({**good, "unreal": "yes"}), True, "true or false")
     expect("an owner with no name", config_errors({**good, "owner": " "}), True, "owner")
+    expect("a stampZone that is a short label (control)", config_errors({**good, "stampZone": "PT"}), False)
+    expect("a stampZone with a space in it", config_errors({**good, "stampZone": "Pacific Time"}), True, "stampZone")
+    expect("an editorPython that is not text", config_errors({**good, "editorPython": 3}), True, "editorPython")
+    apply_config({**good, "stampZone": "PT", "editorPython": "python run_in_editor.py -c"})
+    try:
+        ok = (stamp_now().endswith(" PT") and bool(RE_NOTE_STAMP.match(stamp_now())) and days_since(stamp_now()) == 0
+              and dump_command("PR-E01.04").startswith('python run_in_editor.py -c "exec(open('))
+    finally:
+        apply_config(SELFTEST_PROFILE)
+    expect("stampZone labels every stamp, and editorPython makes the graph-dump command (control)",
+           [] if ok else [stamp_now(), dump_command("PR-E01.04")], False)
     with tempfile.TemporaryDirectory() as tmp:
         cfg_path = Path(tmp) / "ledger_config.json"
 
@@ -3261,11 +3849,529 @@ def _selftest() -> int:
     return 1 if fails else 0
 
 
+def _selftest_review_fixes(expect) -> None:
+    """Checks for the fixes the ledger review of 2026-11-09 asked for: claims, evidence labels, files, rulings, unknown
+    fields, edits, plans, ids past 99, writes to files held open, text encoding, dispatch of a dirty review."""
+    import io
+    import tempfile
+    S1, S2 = "11111111-aaaa-bbbb-cccc-000000000001", "22222222-aaaa-bbbb-cccc-000000000002"
+    acc = {"check": "c", "expect": "e"}
+
+    def task(ident: str, title: str, wave: int = 2, **kw) -> dict:
+        return {"id": ident, "epic": ident.split(".")[0], "title": title, "owner": "Engineering", "size": "S",
+                "wave": wave, "files": ["Source/T.cpp"], "acceptance": dict(acc), "status": "planned", **kw}
+
+    print("claims: who holds a task:")
+    f = _fixture(); f["tasks"][2]["dependsOn"] = []
+    errs, _ = cmd_start(f, "PR-E01.03", None, S1)
+    t = index(f)[1]["PR-E01.03"]
+    ok = (not errs and t["status"] == "in-progress" and t.get("session") == S1 and t.get("heldBy") == "session 11111111"
+          and not validate(f))
+    expect("start records the session that holds it (control)", errs or ([] if ok else [f"task={t}"]), False)
+    errs, lines = cmd_start(f, "PR-E01.03", None, S1)
+    expect("start again from the same session changes nothing (control)",
+           errs or ([] if any("already in progress under you" in x for x in lines) else [str(lines)]), False)
+    expect("start a task another session holds", cmd_start(f, "PR-E01.03", None, S2)[0], True, "--takeover")
+    expect("--takeover with too short a reason", cmd_start(f, "PR-E01.03", None, S2, takeover="gone")[0], True,
+           "--takeover")
+    errs, _ = cmd_start(f, "PR-E01.03", None, S2, takeover="session one was closed by Sam")
+    t = index(f)[1]["PR-E01.03"]
+    ok = not errs and t["session"] == S2 and "Taken over from session 11111111" in t.get("notes", "") and not validate(f)
+    expect("--takeover with a reason: the holder changes and a note says so (control)",
+           errs or ([] if ok else [f"task={t}"]), False)
+    f = _fixture()  # PR-E01.01 is in progress with no holder recorded, as every task was before holders
+    errs, lines = cmd_start(f, "PR-E01.01", None, S1)
+    ok = not errs and index(f)[1]["PR-E01.01"].get("session") == S1 and any("had no holder" in x for x in lines)
+    expect("start on an in-progress task with no holder claims it (control)", errs or ([] if ok else [str(lines)]), False)
+    expect("a named holder with no session claims it too (control)", cmd_start(_fixture(), "PR-E01.01", "Ledger Work")[0],
+           False)
+    f = _fixture(); index(f)[1]["PR-E01.01"]["heldBy"] = "Ledger Work"
+    expect("start under another name, no session on either side", cmd_start(f, "PR-E01.01", "Other Work")[0], True,
+           "--takeover")
+    f = _fixture(); f["tasks"][2]["dependsOn"] = []
+    expect("done on a task that was never started",
+           done_errors(f, "PR-E01.03", "ran-it: x") or set_status(f, "PR-E01.03", "done", evidence="ran-it: x"), True,
+           "never started")
+    f = _fixture(); index(f)[1]["PR-E01.01"].update(status="done", evidence="ran-it: it ran", landed="dv.commit.11")
+    expect("start on a done task without --reopen", cmd_start(f, "PR-E01.01", None, S1)[0], True, "--reopen")
+    errs, _ = cmd_start(f, "PR-E01.01", None, S1, reopen="the fix did not hold in play")
+    t = index(f)[1]["PR-E01.01"]
+    r = (t.get("reopened") or [{}])[0]
+    ok = (not errs and t["status"] == "in-progress" and "evidence" not in t and "landed" not in t
+          and r.get("evidence") == "ran-it: it ran" and r.get("landed") == "dv.commit.11" and r.get("was") == "done"
+          and not validate(f))
+    expect("--reopen brings it back, its evidence and landed kept in its history (control)",
+           errs or ([] if ok else [f"task={t} {validate(f)}"]), False)
+    f = _fixture(); index(f)[1]["PR-E01.02"]["status"] = "withdrawn"
+    expect("start a withdrawn task without --reopen", cmd_start(f, "PR-E01.02", None, S1)[0], True, "--reopen")
+
+    print("evidence starts with its label:")
+    expect("done with evidence that has no label", done_errors(_fixture(), "PR-E01.01", "trust me"), True,
+           "starts with its label")
+    for ev in ("ran-it: the test passed", "read-in-the-code: Source/A.cpp:3 guards it",
+               "read-in-a-document: the spec says so"):
+        expect(f"done with {ev.split(':')[0]} evidence (control)", done_errors(_fixture(), "PR-E01.01", ev), False)
+
+    print("files: narrowing, sharing, and the audit's file rule:")
+    f = _fixture(); f["tasks"].append(dict(task("PR-E01.04", "d", 1), files=["Content/Dir/Other/"]))
+    errs, lines = cmd_start(f, "PR-E01.01", None, S1)
+    ok = not errs and any("Content/Dir/  also on PR-E01.04" in x for x in lines)
+    expect("start names the entries another open task shares (control)", errs or ([] if ok else [str(lines)]), False)
+    expect("start --files that widens the list", cmd_start(_fixture(), "PR-E01.01", None, S1, files=["Source/Z.cpp"])[0],
+           True, "only narrow")
+    f = _fixture()
+    errs, _ = cmd_start(f, "PR-E01.01", None, S1, files=["Source/A.cpp", "Content/Dir/Sub/"])
+    t = index(f)[1]["PR-E01.01"]
+    ok = (not errs and t["files"] == ["Source/A.cpp", "Content/Dir/Sub/"]
+          and t["edits"][0]["changed"]["files"][0] == ["Source/A.cpp", "Content/Dir/"] and not validate(f))
+    expect("start --files narrows the list and records the old one (control)", errs or ([] if ok else [f"task={t}"]),
+           False)
+    c = [{"id": "dv.commit.13", "subject": "PR-E01.01 work", "message": "PR-E01.01 work", "paths": ["Content/Dir/Y.uasset"]}]
+    expect("a commit made before the narrowing is still inside the task's files (control)", judge_commits(f, c)[0], False)
+    c = [{"id": "dv.commit.13", "subject": "PR-E01.01 work", "message": "PR-E01.01 work",
+          "paths": ["Source/A.cpp", "Source/Z.cpp"]}]
+    expect("a commit naming a task, made outside the tool, carrying a file outside its list",
+           judge_commits(_fixture(), c)[0], True, "outside its files list")
+    f = _fixture(); index(f)[1]["PR-E01.01"]["files"] = ["Source/A.cpp", "Content/Kit/Panel"]
+    c = [{"id": "dv.commit.13", "subject": "PR-E01.01 kit", "message": "PR-E01.01 kit",
+          "paths": ["Content/Kit", "Content/Kit/Panel", "Content/Kit/Panel/SM_Panel.uasset", "Source/A.cpp"]}]
+    expect("a commit of a listed folder, as Diversion lists it: the folder, its parent, its files (control)",
+           judge_commits(f, c)[0], False)
+    expect("a rename as Diversion lists it is the new path (control)",
+           [] if renamed_to("Docs/A_PROPOSED.md -> Docs/A.md") == "Docs/A.md" else ["no"], False)
+    c = [{"id": "dv.commit.13", "subject": "PR-E01.01 kit", "message": "PR-E01.01 kit", "paths": ["Content/Kitchen/X.uasset"]}]
+    expect("a folder entry does not allow a folder whose name merely starts the same", judge_commits(f, c)[0], True,
+           "outside its files list")
+    c = [{"id": "dv.commit.13", "subject": "PR-E01: tidy", "message": "PR-E01: tidy", "paths": ["Other/Q.cpp"]}]
+    expect("the same for a commit naming an epic", judge_commits(_fixture(), c)[0], True, "outside every file list")
+    c = [{"id": "dv.commit.13", "subject": "PR-E01.01 more", "paths": ["Source/Z.cpp"],
+          "message": "PR-E01.01 more\n\nRole: Repair\nReason: the hotfix the owner asked for"}]
+    expect("a role commit naming a task is not held to its files (control)", judge_commits(_fixture(), c)[0], False)
+    c = [{"id": "dv.commit.13", "subject": "Checkpoint", "message": "Checkpoint\n\nRole: Checkpoint", "paths": ["X/Y.cpp"]}]
+    expect("a Role line with no Reason line, typed into a commit made outside the tool", judge_commits(_fixture(), c)[0],
+           True, "no 'Reason:' line")
+
+    print("decisions: a ruling changes only with --supersede:")
+    f = _decided(_fixture())
+    d = index(f)[2]["PR-D01"]
+    expect("decide records that the ruling came from chat (control)", [] if d.get("ruledVia") == "chat" else [str(d)],
+           False)
+    expect("decide on a decision already decided", cmd_decide(f, "PR-D01", "no", "Sam", "2026-10-17"), True,
+           "--supersede")
+    errs = cmd_decide(f, "PR-D01", "no", "Sam", "2026-10-17", supersede="Sam changed the call after the playtest")
+    d = index(f)[2]["PR-D01"]
+    s0 = (d.get("superseded") or [{}])[0]
+    ok = (not errs and d["ruling"] == "no" and d["ruledOn"] == "2026-10-17" and s0.get("ruling") == "yes"
+          and s0.get("ruledOn") == "2026-10-16" and not validate(f))
+    expect("--supersede replaces it and keeps the old ruling (control)", errs or ([] if ok else [str(d)]), False)
+    expect("decide with a date that is not one", cmd_decide(_fixture(), "PR-D01", "yes", "Sam", "not-a-date"), True,
+           "not a date")
+    expect("decide with a date in the future", cmd_decide(_fixture(), "PR-D01", "yes", "Sam", "2999-01-01"), True,
+           "future")
+    f = _decided(_fixture()); index(f)[2]["PR-D01"]["ruledOn"] = "yesterday"
+    expect("a ruledOn that is not a date", validate(f), True, "not a date")
+
+    print("fields and waves the tool does not know:")
+    f = _fixture(); f["tasks"][1]["dependOn"] = f["tasks"][1].pop("dependsOn")
+    expect("a task with a misspelled field (dependOn)", validate(f), True, "unknown field 'dependOn'")
+    f = _fixture(); f["tasks"][1]["wave"] = 99
+    expect("a task in a wave the waves table does not name", validate(f), True, "not in meta.json's waves table")
+    f = _fixture(); f["tasks"][1]["wave"] = "2"
+    expect("a wave written as text", validate(f), True, "whole number")
+    f = _fixture(); f["decisions"][0]["rulng"] = "x"
+    expect("a decision with a misspelled field", validate(f), True, "unknown field 'rulng'")
+    f = _fixture(); f["epics"][0]["gaol"] = "x"
+    expect("an epic with a misspelled field", validate(f), True, "unknown field 'gaol'")
+    f = _fixture(); f["tasks"][1].update(needsSam="plays it", notes="n")
+    expect("the owner's needs field and notes are known fields (control)", validate(f), False)
+
+    print("edit-task:")
+    f = _fixture()
+    errs = cmd_edit_task(f, "PR-E01.02", "it belongs with the second slice", {"wave": 2, "title": "b2"})
+    t = index(f)[1]["PR-E01.02"]
+    ok = (not errs and t["wave"] == 2 and t["title"] == "b2" and t["edits"][0]["changed"]["wave"] == [1, 2]
+          and not validate(f))
+    expect("edit-task changes fields, recording the change and why (control)", errs or ([] if ok else [str(t)]), False)
+    expect("edit-task to a wave the table lacks",
+           cmd_edit_task(_fixture(), "PR-E01.02", "it belongs with the second slice", {"wave": 99}), True, "waves table")
+    expect("edit-task with too short a reason", cmd_edit_task(_fixture(), "PR-E01.02", "why", {"wave": 2}), True,
+           "--reason")
+    expect("edit-task on a field it does not edit",
+           cmd_edit_task(_fixture(), "PR-E01.02", "it belongs with the second slice", {"status": "done"}), True,
+           "changes only")
+    f = _fixture(); index(f)[1]["PR-E01.01"].update(status="done", evidence="ran-it: x")
+    expect("edit-task on a finished task",
+           cmd_edit_task(f, "PR-E01.01", "it belongs with the second slice", {"title": "z"}), True, "finished task")
+    f = _fixture()
+    errs = cmd_edit_task(f, "PR-E01.02", "the dependency was filed by mistake", {"dependsOn": []})
+    ok = not errs and "dependsOn" not in index(f)[1]["PR-E01.02"] and not validate(f)
+    expect("edit-task --depends-on none clears the list (control)", errs or ([] if ok else ["still there"]), False)
+
+    print("filing: titles, ids past 99, plans:")
+    spec = {"title": "A", "owner": "Engineering", "size": "S", "wave": 1, "files": ["Source/N.cpp"], "acceptance": acc}
+    expect("add-task with the title an open task carries (case and spacing aside)",
+           cmd_add_task(_fixture(), "PR-E01", dict(spec))[0], True, "already carries the title")
+    expect("the same with --same-title-ok (control)", cmd_add_task(_fixture(), "PR-E01", dict(spec), True)[0], False)
+    f = _fixture(); index(f)[1]["PR-E01.01"].update(status="done", evidence="ran-it: x")
+    expect("a finished task's title can be used again (control)", cmd_add_task(f, "PR-E01", dict(spec))[0], False)
+    f = _fixture()
+    f["tasks"] += [task(f"PR-E01.{n:02d}", f"t{n}") for n in range(4, 100)]
+    errs, ident = cmd_add_task(f, "PR-E01", {**spec, "title": "the hundredth"})
+    ok = (not errs and ident == "PR-E01.100" and not validate(f) and subject_id("PR-E01.100 work") == "PR-E01.100"
+          and RE_ANY_ID.findall("see PR-E01.100.") == ["PR-E01.100"]
+          and RE_FINDING_REF.fullmatch("PR-E01.100#2") is not None)
+    expect("an epic past 99 tasks takes PR-E01.100, and every rule reads it (control)",
+           errs or ([] if ok else [f"ident={ident} {validate(f)[:3]}"]), False)
+    f["tasks"].append(task("PR-E01.999", "t999"))
+    expect("an epic holding task 999 is full", cmd_add_task(f, "PR-E01", {**spec, "title": "one more"})[0], True,
+           "is full")
+    expect("a three-digit number with a leading zero is no task id (control)",
+           [] if not RE_TASK.match("PR-E01.010") and subject_id("PR-E01.010 x") is None else ["matched"], False)
+    with tempfile.TemporaryDirectory() as tmp:
+        f = _fixture()
+        for n in (2, 10, 100, 11):
+            f["epics"].append({"id": f"PR-E{n:02d}", "title": f"epic {n}", "status": "planned", "plan": "p.md"})
+            f["tasks"].append(task(f"PR-E{n:02d}.01", f"first of {n}"))
+        save(f, Path(tmp))
+        order = [e["id"] for e in load(Path(tmp), track=False)["epics"]]
+        ok = order == ["PR-E01", "PR-E02", "PR-E10", "PR-E11", "PR-E100"] and next_epic_id(f) == "PR-E101"
+        expect("epic files load in number order, E100 after E11 (control)", [] if ok else [f"order={order}"], False)
+    plan = {"waves": {"3": "Save and load"},
+            "epics": [{"key": "save", "title": "Save and load", "goal": "progress survives a restart",
+                       "plan": "Docs/save.md",
+                       "tasks": [{"key": "fmt", "title": "save format", "owner": "Engineering", "size": "S", "wave": 3,
+                                  "files": ["Source/Save.cpp"], "acceptance": acc},
+                                 {"title": "load it back", "owner": "Engineering", "size": "M", "wave": 3,
+                                  "files": ["Source/Load.cpp"], "acceptance": acc, "dependsOn": ["@fmt", "@ask"]}]}],
+            "tasks": [{"epic": "PR-E01", "title": "hook it up", "owner": "Engineering", "size": "S", "wave": 3,
+                       "files": ["Source/Hook.cpp"], "acceptance": acc, "dependsOn": ["@fmt"]}],
+            "decisions": [{"key": "ask", "epic": "@save", "question": "Autosave?", "recommendation": "yes",
+                           "options": [{"label": "Yes", "detail": "every minute", "recommended": True},
+                                       {"label": "No", "detail": "by hand only"}]}]}
+    f = _fixture()
+    errs, made = cmd_add_plan(f, copy.deepcopy(plan))
+    _, tasks, decisions = index(f)
+    ok = (not errs and [i for _, i in made] == ["PR-E02", "PR-D02", "PR-E02.01", "PR-E02.02", "PR-E01.04"]
+          and tasks["PR-E02.02"]["dependsOn"] == ["PR-E02.01", "PR-D02"] and decisions["PR-D02"]["epic"] == "PR-E02"
+          and f["waves"]["3"] == "Save and load" and not validate(f))
+    expect("add-plan files a wave, an epic with tasks, a task and a decision, keys resolved (control)",
+           errs or ([] if ok else [f"made={made} {validate(f)[:3]}"]), False)
+    f = _fixture(); before = copy.deepcopy(f)
+    bad = copy.deepcopy(plan); bad["tasks"][0]["dependsOn"] = ["@nothing"]
+    expect("a plan naming a key it does not hold", cmd_add_plan(f, bad)[0], True, "names no key")
+    expect("a refused plan writes nothing (control)", [] if f == before else ["the ledger changed"], False)
+    bad = copy.deepcopy(plan); bad["epics"][0]["title"] = "E"  # the fixture's open epic is titled "e"
+    expect("a plan filing an epic whose title an open epic carries", cmd_add_plan(_fixture(), bad)[0], True,
+           "already carries the title")
+    bad = copy.deepcopy(plan); bad["waves"] = {"1": "another name"}
+    expect("a plan renaming a wave", cmd_add_plan(_fixture(), bad)[0], True, "does not rename")
+    bad = copy.deepcopy(plan); bad["epics"][0]["tasks"][0]["wave"] = 7
+    expect("a plan with a task in a wave nobody named", cmd_add_plan(_fixture(), bad)[0], True, "waves table")
+    bad = copy.deepcopy(plan); bad["epics"][0]["tasks"] = []
+    expect("a plan filing an epic with no task", cmd_add_plan(_fixture(), bad)[0], True, "at least one task")
+    expect("a plan with a key the format does not have", cmd_add_plan(_fixture(), {"epic": []})[0], True, "unknown key")
+
+    print("writes when another program holds a file open:")
+    saved_replace, saved_retry, saved_md = _os_replace, REPLACE_RETRY_S, LEDGER_MD
+
+    def failing(times: int, only: str = ""):
+        n = {"calls": 0}
+
+        def rep(a, b):
+            n["calls"] += 1
+            if (not only or only in str(b)) and n["calls"] <= times:
+                raise PermissionError(13, "Access is denied")
+            saved_replace(a, b)
+        return rep
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        globals()["REPLACE_RETRY_S"] = 0.3
+        try:
+            target = root / "x.txt"
+            target.write_text("old", encoding="utf-8")
+            globals()["_os_replace"] = failing(2)
+            _write_atomic(target, "new")
+            ok = target.read_text(encoding="utf-8") == "new" and not list(root.glob("*.tmp"))
+            expect("a write retries while the file is held open, then lands (control)", [] if ok else ["not written"],
+                   False)
+            globals()["_os_replace"] = failing(10 ** 6)
+            try:
+                _write_atomic(target, "newer")
+                errs = []
+            except PermissionError as e:
+                errs = [str(e)]
+            ok = target.read_text(encoding="utf-8") == "new" and not list(root.glob("*.tmp"))
+            expect("a write that never lands fails, leaving the file as it was and no temporary file",
+                   errs if ok else ["a .tmp file was left, or the file changed"], True, "denied")
+            f = _fixture()
+            f["epics"].append({"id": "PR-E02", "title": "two", "status": "planned", "plan": "q.md"})
+            f["tasks"].append(task("PR-E02.01", "z"))
+            globals()["_os_replace"] = saved_replace
+            save(f, root / "led")
+            g = load(root / "led")
+            index(g)[1]["PR-E01.01"]["notes"] = "one"
+            index(g)[1]["PR-E02.01"]["notes"] = "two"
+            before = {p.name: p.read_text(encoding="utf-8") for p in (root / "led" / "epics").glob("*.json")}
+            globals()["_os_replace"] = failing(10 ** 6, only="PR-E02")
+            try:
+                save(g)
+                errs = []
+            except LedgerError as e:
+                errs = [str(e)]
+            after = {p.name: p.read_text(encoding="utf-8") for p in (root / "led" / "epics").glob("*.json")}
+            ok = after == before and not list((root / "led").rglob("*.tmp"))
+            expect("a save whose second file cannot be written puts the first back, so nothing lands half",
+                   errs if ok else ["a file changed, or a .tmp file was left"], True, "Nothing was saved")
+            globals()["_os_replace"] = failing(10 ** 6)
+            globals()["LEDGER_MD"] = root / "LEDGER.md"
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                wrote = write_render(_fixture())
+            ok = wrote is False and "the change is saved" in err.getvalue() and "ledger.py render" in err.getvalue()
+            expect("LEDGER.md held open: the command says it saved and LEDGER.md is behind, no traceback (control)",
+                   [] if ok else [err.getvalue()], False)
+            try:
+                write_render(_fixture(), required=True)
+                errs = []
+            except LedgerError as e:
+                errs = [str(e)]
+            expect("render itself refuses when it cannot write LEDGER.md", errs, True, "could not be written")
+            if os.name == "nt":
+                # The real thing: Windows will not replace a file another handle holds open.
+                globals()["_os_replace"] = saved_replace
+                held = open(target, encoding="utf-8")
+                timer = threading.Timer(0.15, held.close)
+                timer.start()
+                try:
+                    _write_atomic(target, "while held")
+                    errs = []
+                except OSError as e:
+                    errs = [str(e)]
+                timer.join()
+                ok = target.read_text(encoding="utf-8") == "while held"
+                expect("Windows: a file another handle holds open is written once the handle lets go (control)",
+                       errs or ([] if ok else ["not written"]), False)
+        finally:
+            globals()["_os_replace"], globals()["REPLACE_RETRY_S"], globals()["LEDGER_MD"] = (saved_replace, saved_retry,
+                                                                                              saved_md)
+
+    print("text encoding and ordinary slips:")
+    with tempfile.TemporaryDirectory() as tmp:
+        m = Path(tmp) / "msg.txt"
+        m.write_bytes("\ufeffPR-E01.01 work\n".encode("utf-8"))
+        msg = read_text_file(str(m), "--message")
+        expect("a message file starting with a byte order mark still names its task (control)",
+               [] if subject_id(msg) == "PR-E01.01" else [repr(msg[:20])], False)
+        j = Path(tmp) / "task.json"
+        j.write_bytes("\ufeff{\"title\": \"a \u2192 b\"}".encode("utf-8"))
+        expect("a task file with a byte order mark and an arrow reads (control)",
+               [] if read_json_file(str(j), "--from") == {"title": "a \u2192 b"} else ["not read"], False)
+        for name, setup, needle in (("does not exist", None, "does not exist"), ("is not JSON", "{ nope", "not valid JSON")):
+            p = Path(tmp) / "spec.json"
+            if setup:
+                p.write_text(setup, encoding="utf-8")
+            try:
+                read_json_file(str(p), "--from")
+                errs = []
+            except LedgerError as e:
+                errs = [str(e)]
+            expect(f"a --from file that {name} is one refusal, not a traceback", errs, True, needle)
+    code = (f"import sys; sys.path.insert(0, {str(HERE)!r}); import ledger; sys.stdout.reconfigure(encoding='cp1252'); "
+            f"ledger.main(['version']); print('\\u2192 arrow')")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True)
+    ok = r.returncode == 0 and "\u2192 arrow".encode("utf-8") in r.stdout
+    expect("output through a pipe is UTF-8 whatever the code page, so an arrow prints (control)",
+           [] if ok else [r.stderr.decode("utf-8", "replace")[-300:]], False)
+
+    print("dispatch reads the working copy, and says so:")
+    saved_agents = AGENTS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        globals()["AGENTS_DIR"] = Path(tmp)
+        (Path(tmp) / "security-department.md").write_text("---\nname: security-department\n---\n", encoding="utf-8")
+
+        def review() -> dict:
+            f = _fixture()
+            f["departments"][1]["agent"] = "security-department"
+            f["tasks"][0].update(files=["Source/A.cpp"], status="done", evidence="ran-it: x", landed="dv.commit.11")
+            f["tasks"].append(dict(task("PR-E01.04", "review a", 1), owner="Security Department", kind="review",
+                                   parent="PR-E01.01", files=[]))
+            return f
+        try:
+            globals()["UNCOMMITTED"] = lambda files: ["Source/A.cpp"]
+            expect("dispatch a review whose covered files have uncommitted changes",
+                   cmd_dispatch(review(), "PR-E01.04", "Ledger Work", None, False)[0], True, "uncommitted changes")
+            f = review()
+            errs, out = cmd_dispatch(f, "PR-E01.04", "Ledger Work", None, False,
+                                     dirty_ok="another session is mid-edit on A; review it as it stands", session=S1)
+            t = index(f)[1]["PR-E01.04"]
+            ok = (not errs and "uncommitted changes" in out["prompt"] and "Source/A.cpp" in out["prompt"]
+                  and t.get("dispatchedSession") == S1 and "Dispatched with uncommitted changes" in t.get("notes", "")
+                  and not validate(f))
+            expect("--dirty-ok sends it, the prompt names the files and a note says why (control)",
+                   errs or ([] if ok else [f"task={t}"]), False)
+
+            def cannot_ask(files):
+                raise RuntimeError("dv diff failed")
+            globals()["UNCOMMITTED"] = cannot_ask
+            expect("dispatch when the version control cannot be asked",
+                   cmd_dispatch(review(), "PR-E01.04", "Ledger Work", None, False)[0], True, "could not ask")
+            globals()["UNCOMMITTED"] = lambda files: []
+            errs, out = cmd_dispatch(review(), "PR-E01.04", "Ledger Work", None, False)
+            ok = not errs and "as they stand in the working copy" in out["prompt"] and "is what landed" in out["prompt"]
+            expect("a clean review's prompt says the working copy is what landed (control)",
+                   errs or ([] if ok else [out["prompt"][:300]]), False)
+        finally:
+            globals()["AGENTS_DIR"] = saved_agents
+            globals()["UNCOMMITTED"] = lambda files: []
+
+
+def _load_hook(name: str):
+    """A hook module from .claude/hooks/, or None in a project that does not have it."""
+    import importlib.util
+    path = REPO / ".claude" / "hooks" / f"{name}.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(f"_ledger_hook_{name}", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _selftest_hooks(expect) -> None:
+    """The hooks read transcript fields Claude Code does not document (turnOrigin, queue-operation, queued_command);
+    if an update renamed one, they would go quiet with no error. These run them on lines shaped like the transcripts
+    Claude Code 2.1.3xx writes, and on the commands the fence and the Stop hook must and must not match."""
+    import tempfile
+    stop, fence, msgs = _load_hook("ledger_stop"), _load_hook("department_fence"), _load_hook("owner_message_check")
+    if not (stop and fence and msgs):
+        print("hooks: .claude/hooks/ lacks ledger_stop.py, department_fence.py or owner_message_check.py; not checked")
+        return
+    S1 = "11111111-aaaa-bbbb-cccc-000000000001"
+    t0 = datetime(2026, 11, 9, 10, 0, 0)
+
+    def at(seconds: int) -> str:
+        return (t0 + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    def user(text: str, s: int, origin: str | None = "human") -> dict:
+        e = {"type": "user", "isSidechain": False, "timestamp": at(s), "message": {"role": "user", "content": text}}
+        if origin:
+            e["turnOrigin"] = origin
+        return e
+
+    def bash(command: str, s: int) -> dict:
+        return {"type": "assistant", "isSidechain": False, "timestamp": at(s),
+                "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash",
+                                                              "input": {"command": command}}]}}
+
+    def said(text: str, s: int) -> dict:
+        return {"type": "assistant", "isSidechain": False, "timestamp": at(s),
+                "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}
+
+    def queued(text: str, kind: str, s: int) -> dict:
+        return {"type": "attachment", "isSidechain": False, "timestamp": at(s),
+                "attachment": {"type": "queued_command", "prompt": text, "origin": {"kind": kind}}}
+
+    def enqueue(text: str, s: int) -> dict:
+        return {"type": "queue-operation", "operation": "enqueue", "timestamp": at(s), "content": text}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        def transcript(*entries) -> Path:
+            p = Path(tmp) / f"t{uuid.uuid4().hex[:6]}.jsonl"
+            p.write_text("".join(json.dumps(e, separators=(",", ":")) + "\n" for e in entries), encoding="utf-8")
+            return p
+
+        print("hooks: the Stop hook:")
+        tr = transcript(user("Do the next task", 0), bash("ls", 5), queued("is the build done?", "human", 9),
+                        queued("<task-notification>x</task-notification>", "task-notification", 10))
+        origin, start, mid, missing = stop.this_reply(tr)
+        ok = origin == "human" and start == "Do the next task" and mid == ["is the build done?"] and not missing
+        expect("reads who started the reply and what the owner wrote mid-reply (control)",
+               [] if ok else [f"{origin} {start!r} {mid} {missing}"], False)
+        missing = stop.this_reply(transcript(user("Do the next task", 0, origin=None), bash("ls", 5)))[3]
+        expect("a transcript with user turns and no turnOrigin is flagged (Claude Code renamed it)",
+               ["flagged"] if missing else [], True, "flagged")
+        for text, promise in (("Done. I\u2019ll fix the bridge next.", True), ("I'll run the build now.", True),
+                              ("If you want, I'll add a test for it.", False), ("Want me to add one?", False),
+                              ("The fix is in and the test passes.", False)):
+            got = stop.promised_work(transcript(user("go", 0), said(text, 5)))
+            expect(f"promise check on {text!r} ({'a promise' if promise else 'no promise'}) (control)",
+                   [] if bool(got) == promise else [f"got {got!r}"], False)
+        tr = transcript(user("go", 0),
+                        bash("uv run Docs/Ledger/ledger.py start PR-E01.01", 5),
+                        bash("./Docs/Ledger/ledger.py start PR-E01.02 --by x", 6),
+                        bash('"C:/Program Files/Python/python.exe" "D:/my proj/Docs/Ledger/ledger.py" start PR-E01.100', 7),
+                        bash("cd x && X=1 python Docs/Ledger/ledger.py dispatch PR-E01.04 --by hub", 8),
+                        bash('grep -n "ledger.py start PR-E01.05" README.md', 9),
+                        bash('echo "then ledger.py start PR-E01.06"', 10))
+        got = sorted(task for _, task, _ in stop.ledger_commands(tr))
+        ok = got == ["PR-E01.01", "PR-E01.02", "PR-E01.04", "PR-E01.100"]
+        expect("finds start and dispatch however python is spelled, never in a grep or an echo (control)",
+               [] if ok else [f"got {got}"], False)
+        f = _fixture()
+        index(f)[1]["PR-E01.02"].update(session=S1)
+        ok = stop.session_tasks(f, S1) == ["PR-E01.02"] and stop.session_tasks(f, "someone-else") == []
+        expect("knows the tasks this session started from the session id start recorded (control)",
+               [] if ok else ["no"], False)
+        saved_answers = ANSWERS_JSON
+        globals()["ANSWERS_JSON"] = Path(tmp) / "answers.json"
+        try:
+            L = sys.modules[__name__]
+            lines = stop.hub_work(L, _fixture(), set())
+            ok = any(x.startswith("CONTINUE  PR-E01.01") and "nobody's" in x for x in lines)
+            expect("lists a stale in-progress task nobody holds (control)", [] if ok else [str(lines)], False)
+            f = _fixture(); index(f)[1]["PR-E01.01"].update(heldBy="session 22222222", session="2222")
+            lines = stop.hub_work(L, f, set())
+            expect("does not push a session onto a task another session holds",
+                   [x for x in lines if "PR-E01.01" in x] or ["not listed"], True, "not listed")
+        finally:
+            globals()["ANSWERS_JSON"] = saved_answers
+
+        print("hooks: the owner's mid-reply messages:")
+        entries = [enqueue("Do the next task", 0), user("Do the next task", 1), enqueue("is the build done?", 60),
+                   enqueue("<task-notification>x</task-notification>", 61)]
+        now = (t0 + timedelta(seconds=120)).replace(tzinfo=timezone.utc)
+        got = msgs.unanswered([json.loads(json.dumps(e)) for e in entries], now)
+        ok = [t for _, t in got] == ["is the build done?"]
+        expect("flags a message sent mid-reply, not the one that started it nor a notification (control)",
+               [] if ok else [f"got {got}"], False)
+
+        print("hooks: the department fence:")
+        hub = ["uv run Docs/Ledger/ledger.py confirm PR-E01.04 --by x --evidence y",
+               "X=1 python Docs/Ledger/ledger.py done PR-E01.01 --evidence ran-it",
+               "env python Docs/Ledger/ledger.py commit --message m Source/A.cpp",
+               "./Docs/Ledger/ledger.py route PR-E01.04#1 --to PR-E01.02",
+               "cd /d/proj && \"C:/Python 3/python.exe\" Docs/Ledger/ledger.py note PR-E01.04 --text x",
+               "git -C . commit -m x", "git -c user.name=x commit -m y", "dv commit Source/A.cpp -m x",
+               "echo {} > Docs/Ledger/meta.json", "cat x >> ./Docs/Ledger/epics/PR-E01.json",
+               "python -c \"import importlib; importlib.import_module('ledger')\"",
+               "python -c \"__import__('ledger').load()\"", "cd Docs/Ledger && python -c \"import ledger\"",
+               "python - <<'EOF'\nfrom ledger import load\nEOF", "claude -p hello", "npx claude --help"]
+        for command in hub:
+            expect(f"fence refuses: {command.splitlines()[0][:60]}", [fence.refusal("Bash", {"command": command})]
+                   if fence.refusal("Bash", {"command": command}) else [], True, "")
+        allowed = ["grep -n \"ledger.py confirm\" Docs/Ledger/README.md", "echo \"then run ledger.py done\"",
+                   "python Docs/Ledger/ledger.py show PR-E01.04",
+                   "uv run Docs/Ledger/ledger.py finding PR-E01.04 --severity hardening --text t --evidence S/A.cpp:1",
+                   "git log -n 3 --format=%s", "git show HEAD:Source/A.cpp", "cat Docs/Ledger/meta.json",
+                   "dv show dv.commit.12 --name-status", "rg \"commit\" Source/", "python tools/check.py > out.txt"]
+        for command in allowed:
+            expect(f"fence allows: {command[:60]} (control)",
+                   [fence.refusal("Bash", {"command": command})] if fence.refusal("Bash", {"command": command}) else [],
+                   False)
+        expect("fence refuses a PowerShell write into the ledger",
+               [fence.refusal("PowerShell", {"command": "Set-Content Docs/Ledger/meta.json '{}'"}) or ""], True,
+               "ledger")
+        expect("fence refuses a Write tool into the ledger",
+               [fence.refusal("Write", {"file_path": "D:/proj/Docs/Ledger/meta.json"}) or ""], True, "ledger")
+
+
 # --------------------------------------------------------------------------- adding to the ledger
 
 def stamp_now() -> str:
-    """A note's stamp, from this machine's local clock."""
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
+    """A note's stamp, from this machine's local clock, with the config's stampZone label after it when there is one
+    ("2026-10-16 19:45 PT"). Readers take the first 10 or 16 characters, so the label never changes what they read."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M") + (f" {STAMP_ZONE}" if STAMP_ZONE else "")
 
 
 def cmd_note(ledger: dict, ident: str, text: str) -> list[str]:
@@ -3301,9 +4407,17 @@ def cmd_withdraw(ledger: dict, ident: str, reason: str) -> list[str]:
     return []
 
 
-def next_task_id(ledger: dict, epic: str) -> str:
-    nums = [int(t["id"].split(".")[1]) for t in ledger["tasks"] if t["id"].startswith(epic + ".")]
-    return f"{epic}.{(max(nums) + 1 if nums else 1):02d}"
+def next_task_id(ledger: dict, epic: str) -> str | None:
+    """The next free task id in an epic: two digits to 99, then three; None once the epic is full (ID_MAX)."""
+    nums = [task_num(t["id"]) for t in ledger["tasks"] if t["id"].startswith(epic + ".")]
+    n = max(nums) + 1 if nums else 1
+    return f"{epic}.{n:02d}" if n <= ID_MAX else None
+
+
+def next_epic_id(ledger: dict) -> str | None:
+    nums = [epic_num(e["id"]) for e in ledger["epics"]]
+    n = max(nums) + 1 if nums else 1
+    return f"{PREFIX}-E{n:02d}" if n <= ID_MAX else None
 
 
 def next_decision_id(ledger: dict) -> str:
@@ -3311,11 +4425,31 @@ def next_decision_id(ledger: dict) -> str:
     return f"{PREFIX}-D{(max(nums) + 1 if nums else 1):02d}"
 
 
-def cmd_add_task(ledger: dict, epic: str, spec: dict) -> tuple[list[str], str | None]:
+def norm_title(s) -> str:
+    return " ".join(str(s or "").split()).casefold()
+
+
+def same_title(ledger: dict, coll: str, title, skip: str | None = None) -> list[str]:
+    """The open epics (coll 'epics') or open tasks ('tasks') that already carry this title, ignoring case and spacing.
+    Two sessions filed the same epic four minutes apart; the second sat in the ledger, withdrawn, for good."""
+    want = norm_title(title)
+    return [x["id"] for x in ledger[coll] if x.get("id") != skip and x.get("status") not in FINISHED
+            and want and norm_title(x.get("title")) == want]
+
+
+def cmd_add_task(ledger: dict, epic: str, spec: dict, same_title_ok: bool = False) -> tuple[list[str], str | None]:
     """Add a task to an epic under the next free id. spec holds the task's fields; its id and epic are ignored."""
     if epic not in index(ledger)[0]:
         return [f"unknown epic {epic}"], None
+    if not isinstance(spec, dict):
+        return ["the task file holds one JSON object: the task's fields"], None
     ident = next_task_id(ledger, epic)
+    if not ident:
+        return [f"{epic} is full: it holds task {ID_MAX}. File the work under another open epic"], None
+    dupes = [] if same_title_ok else same_title(ledger, "tasks", spec.get("title"))
+    if dupes:
+        return [f"an open task already carries the title '{spec.get('title')}': {', '.join(dupes)}. If this is "
+                f"another task all the same, add it with --same-title-ok"], None
     t = {"id": ident, "epic": epic, **{k: v for k, v in spec.items() if k not in ("id", "epic")}}
     t.setdefault("status", "planned")
     trial = copy.deepcopy(ledger)
@@ -3325,6 +4459,163 @@ def cmd_add_task(ledger: dict, epic: str, spec: dict) -> tuple[list[str], str | 
         return errs, None
     ledger["tasks"].append(t)
     return [], ident
+
+
+PLAN_KEYS = ("waves", "epics", "tasks", "decisions")
+
+
+def cmd_add_plan(ledger: dict, plan: dict, same_title_ok: bool = False) -> tuple[list[str], list[tuple[str, str]]]:
+    """File a plan in one go: new wave names, epics with their tasks, tasks under existing epics, and decisions. All of
+    it is checked together and written together, or nothing is. Returns (errors, [(where in the plan, new id)]).
+
+    The largest change one ledger took (28 epics, 150 tasks, the wave names) went in through a script in a session's
+    scratchpad, because no command filed in bulk. A plan is now a file to read:
+
+        {"waves": {"12": "Save and load"},
+         "epics": [{"key": "save", "title": "...", "goal": "...", "plan": "Docs/...",
+                    "tasks": [{"key": "fmt", "title": "...", "owner": ..., "size": ..., "wave": 12, "files": [...],
+                               "acceptance": {"check": ..., "expect": ...}}]}],
+         "tasks": [{"epic": "PR-E03", "title": "...", "dependsOn": ["@fmt", "@ask"], ...}],
+         "decisions": [{"key": "ask", "epic": "@save", "question": ..., "recommendation": ..., "options": [...]}]}
+
+    A "key" names an item inside the plan, and "@key" in an epic, dependsOn or parent stands for the id it gets. Ids
+    are the next free ones, assigned in the file's order."""
+    if not isinstance(plan, dict):
+        return ["a plan file holds one JSON object"], []
+    unknown = [k for k in plan if k not in PLAN_KEYS and not str(k).startswith("_")]
+    if unknown:
+        return [f"unknown key(s) {unknown}: a plan holds {', '.join(PLAN_KEYS)} (a key starting with _ is a note)"], []
+    trial = copy.deepcopy(ledger)
+    errs: list[str] = []
+    keyed: dict[str, str] = {}
+    made: list[tuple[str, str]] = []
+
+    def take_key(item: dict, where: str, ident: str) -> None:
+        k = item.get("key")
+        if k is None:
+            return
+        if not isinstance(k, str) or not k.strip() or k in keyed:
+            errs.append(f"{where}: key {k!r} is empty or used twice in the plan")
+        else:
+            keyed[k] = ident
+
+    def resolve(ref, where: str):
+        if isinstance(ref, str) and ref.startswith("@"):
+            if ref[1:] in keyed:
+                return keyed[ref[1:]]
+            errs.append(f"{where}: '{ref}' names no key in the plan")
+        return ref
+
+    def as_list(name: str) -> list:
+        v = plan.get(name) or []
+        if not isinstance(v, list):
+            errs.append(f"'{name}' is a list")
+            return []
+        return v
+
+    waves = plan.get("waves") or {}
+    if not isinstance(waves, dict):
+        errs.append("'waves' is an object: {\"<number>\": \"<what the wave is>\"}")
+        waves = {}
+    table = trial.setdefault("waves", {})
+    for w, name in waves.items():
+        if not re.fullmatch(r"\d+", str(w)) or not str(name or "").strip():
+            errs.append(f"waves: '{w}' needs a whole number and a name")
+        elif str(w) in table and table[str(w)] != name:
+            errs.append(f"waves: wave {w} is already '{table[str(w)]}'; a plan adds waves, it does not rename them")
+        else:
+            table[str(w)] = name
+    trial["waves"] = dict(sorted(table.items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 0))
+
+    pending: list[tuple[str, object, object]] = []
+    for n, e in enumerate(as_list("epics")):
+        where = f"epics[{n}]"
+        if not isinstance(e, dict):
+            errs.append(f"{where}: an epic is an object")
+            continue
+        eid = next_epic_id(trial)
+        if not eid:
+            errs.append(f"{where}: the ledger holds epic {ID_MAX}; no epic id is left")
+            break
+        take_key(e, where, eid)
+        bad = [k for k in e if k not in (EPIC_FIELDS - {"id", "status"}) | {"key", "tasks"}]
+        if bad:
+            errs.append(f"{where}: unknown field(s) {bad} (an epic takes title, goal, plan, key and tasks)")
+        dupes = [] if same_title_ok else same_title(trial, "epics", e.get("title"))
+        if dupes:
+            errs.append(f"{where}: an open epic already carries the title '{e.get('title')}': {', '.join(dupes)} "
+                        f"(--same-title-ok if it is another epic all the same)")
+        trial["epics"].append({"id": eid, "title": e.get("title"), "status": "planned", "plan": e.get("plan"),
+                               **({"goal": e["goal"]} if e.get("goal") else {})})
+        made.append((e.get("key") or where, eid))
+        tasks_in = e.get("tasks") or []
+        if not isinstance(tasks_in, list) or not tasks_in:
+            errs.append(f"{where}: an epic is filed with at least one task ('tasks')")
+            tasks_in = []
+        pending += [(f"{where}.tasks[{m}]", eid, t) for m, t in enumerate(tasks_in)]
+    pending += [(f"tasks[{n}]", t.get("epic") if isinstance(t, dict) else None, t)
+                for n, t in enumerate(as_list("tasks"))]
+
+    new_decisions = []
+    for n, d in enumerate(as_list("decisions")):
+        where = f"decisions[{n}]"
+        if not isinstance(d, dict):
+            errs.append(f"{where}: a decision is an object")
+            continue
+        did = next_decision_id(trial)
+        take_key(d, where, did)
+        dd = {"id": did, **{k: v for k, v in d.items() if k not in ("id", "key", "epic")}, "epic": d.get("epic")}
+        dd.setdefault("status", "open")
+        trial["decisions"].append(dd)
+        new_decisions.append((where, dd))
+        made.append((d.get("key") or where, did))
+
+    new_tasks = []
+    for where, epic_ref, t in pending:
+        if not isinstance(t, dict):
+            errs.append(f"{where}: a task is an object")
+            continue
+        epic = resolve(epic_ref, where)
+        if epic not in index(trial)[0]:
+            errs.append(f"{where}: epic '{epic_ref}' is no epic in the ledger or the plan")
+            continue
+        tid = next_task_id(trial, epic)
+        if not tid:
+            errs.append(f"{where}: {epic} is full (it holds task {ID_MAX})")
+            continue
+        take_key(t, where, tid)
+        dupes = [] if same_title_ok else same_title(trial, "tasks", t.get("title"))
+        if dupes:
+            errs.append(f"{where}: an open task already carries the title '{t.get('title')}': {', '.join(dupes)} "
+                        f"(--same-title-ok if it is another task all the same)")
+        task = {"id": tid, "epic": epic, **{k: v for k, v in t.items() if k not in ("id", "epic", "key")}}
+        task.setdefault("status", "planned")
+        trial["tasks"].append(task)
+        new_tasks.append((where, task))
+        made.append((t.get("key") or where, tid))
+
+    for where, dd in new_decisions:
+        dd["epic"] = resolve(dd["epic"], where)
+    for where, task in new_tasks:
+        if isinstance(task.get("dependsOn"), list):
+            task["dependsOn"] = [resolve(x, where) for x in task["dependsOn"]]
+        if task.get("parent"):
+            task["parent"] = resolve(task["parent"], where)
+    if not made and not waves:
+        errs.append("the plan files nothing: it has no waves, epics, tasks or decisions")
+    if errs:
+        return errs, []
+    try:
+        split(trial)  # a decision whose epic does not exist cannot be filed
+    except LedgerError as e:
+        return [str(e)], []
+    new_ids = {i for _, i in made}
+    errs = [e for e in validate(trial) if e.split(":")[0].split("#")[0] in new_ids or e.startswith("waves")]
+    if errs:
+        return errs, []
+    ledger.clear()
+    ledger.update(trial)
+    return [], made
 
 
 def cmd_add_decision(ledger: dict, epic: str, spec: dict) -> tuple[list[str], str | None]:
@@ -3346,23 +4637,59 @@ def cmd_add_decision(ledger: dict, epic: str, spec: dict) -> tuple[list[str], st
 
 # --------------------------------------------------------------------------- main
 
-MUTATING = {"start", "done", "block", "withdraw", "note", "add-task", "add-decision", "decide", "apply", "render", "commit",
-            "dispatch", "submit", "confirm", "finding", "route"}
+MUTATING = {"start", "done", "block", "withdraw", "note", "add-task", "add-decision", "add-plan", "edit-task", "decide",
+            "apply", "render", "commit", "dispatch", "submit", "confirm", "finding", "route"}
+
+
+def read_text_file(path: str, what: str) -> str:
+    """A file the caller named, read as UTF-8 with any byte order mark dropped (Windows PowerShell 5.1 writes one, and
+    the mark hid the task id at the start of a commit subject)."""
+    try:
+        return Path(path).read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        raise LedgerError(f"{what} {path} does not exist")
+    except UnicodeDecodeError as e:
+        raise LedgerError(f"{what} {path} is not UTF-8 text ({e})")
+
+
+def read_json_file(path: str, what: str):
+    try:
+        return json.loads(read_text_file(path, what))
+    except json.JSONDecodeError as e:
+        raise LedgerError(f"{what} {path} is not valid JSON: {e}")
 
 
 def main(argv: list[str]) -> int:
+    # Python's output through a pipe is the code page on Windows (1252), and one arrow in a task title ended `next`
+    # in UnicodeEncodeError - after `dispatch` had already saved. Write UTF-8 whatever the console.
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, ValueError):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description="Task ledger")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("next"); sub.add_parser("status"); sub.add_parser("validate")
-    sub.add_parser("audit"); sub.add_parser("check"); sub.add_parser("selftest")
+    sub.add_parser("audit"); sub.add_parser("check"); sub.add_parser("selftest"); sub.add_parser("version")
     p = sub.add_parser("show"); p.add_argument("id")
     p = sub.add_parser("start"); p.add_argument("task")
-    p.add_argument("--by", help="who holds it; required on a department subtask (\"<department> agent\")")
-    p = sub.add_parser("done"); p.add_argument("task"); p.add_argument("--evidence", required=True)
+    p.add_argument("--by", help="who holds it (default: this Claude Code session); required on a department subtask "
+                                "(\"<department> agent\")")
+    p.add_argument("--takeover", help="the task is in progress under another holder whose session is gone: why")
+    p.add_argument("--reopen", help="the task is done or withdrawn and must be worked again: why (its evidence and "
+                                    "landed commit move to its history)")
+    p.add_argument("--files", nargs="+", help="narrow the task's files list to these (each inside an entry it has)")
+    p = sub.add_parser("done"); p.add_argument("task")
+    p.add_argument("--evidence", required=True, help=f"starts with {', '.join(EVIDENCE_LABELS)}: then what showed")
+    p = sub.add_parser("edit-task", help="change an unfinished task's title, wave, dependencies, files or acceptance")
+    p.add_argument("task"); p.add_argument("--reason", required=True, help="why it changes (recorded in its edits)")
+    p.add_argument("--title"); p.add_argument("--wave", type=int)
+    p.add_argument("--depends-on", nargs="+", help="the whole new dependsOn list, or 'none'")
+    p.add_argument("--files", nargs="+", help="the whole new files list")
+    p.add_argument("--check", help="the acceptance check"); p.add_argument("--expect", help="what passing shows")
     p = sub.add_parser("dispatch", help="hub: send a department subtask out; prints the agent and its prompt")
     p.add_argument("task"); p.add_argument("--by", help="the hub session's title")
     p.add_argument("--dump", help="the graph dump folder, for a review that covers Blueprints")
     p.add_argument("--restart", action="store_true", help="the subtask's agent is gone: start a new one on it")
+    p.add_argument("--dirty-ok", help="covered files have uncommitted changes and the review goes out anyway: why")
     p = sub.add_parser("submit", help="department agent: hand the work in (the task stays in progress)")
     p.add_argument("task"); p.add_argument("--evidence", required=True)
     p = sub.add_parser("confirm", help="hub: one pointer re-checked; marks the subtask done")
@@ -3389,11 +4716,17 @@ def main(argv: list[str]) -> int:
     p = sub.add_parser("note"); p.add_argument("task"); p.add_argument("--text", required=True)
     p = sub.add_parser("add-task"); p.add_argument("--epic", required=True)
     p.add_argument("--from", dest="spec", required=True, help="a JSON file holding the task's fields")
+    p.add_argument("--same-title-ok", action="store_true", help="an open task has this title, and this is another")
     p = sub.add_parser("add-decision"); p.add_argument("--epic", required=True)
     p.add_argument("--from", dest="spec", required=True, help="a JSON file: question, recommendation, options, source")
+    p = sub.add_parser("add-plan", help="file waves, epics, tasks and decisions from one JSON file, all or nothing")
+    p.add_argument("--from", dest="spec", required=True, help="the plan file (README, 'Filing a plan')")
+    p.add_argument("--same-title-ok", action="store_true", help="file items whose titles open ones already carry")
+    p.add_argument("--dry-run", action="store_true", help="check it and print the ids it would take; write nothing")
     p = sub.add_parser("decide"); p.add_argument("decision"); p.add_argument("--ruling", required=True)
     p.add_argument("--by", required=True, help=f"who ruled - {OWNER}, for a ruling given in chat")
-    p.add_argument("--date", required=True)
+    p.add_argument("--date", required=True, help="the day of the ruling, YYYY-MM-DD")
+    p.add_argument("--supersede", help="the decision is already ruled and this ruling replaces it: why")
     p = sub.add_parser("apply"); p.add_argument("decision")
     p = sub.add_parser("render"); p.add_argument("--check", action="store_true")
     p = sub.add_parser("commit")
@@ -3406,12 +4739,20 @@ def main(argv: list[str]) -> int:
 
     if a.cmd == "selftest":
         return selftest()
-    writes = a.cmd in MUTATING and not (a.cmd == "render" and a.check)
+    if a.cmd == "version":
+        print(f"ledger.py {VERSION}")
+        return 0
+    writes = a.cmd in MUTATING and not (a.cmd == "render" and a.check) and not getattr(a, "dry_run", False)
+    # Ordinary slips (a missing --message file, bad JSON in --from, a version control call that failed) ended in a
+    # traceback; each is one REFUSED line.
     try:
         with (ledger_lock() if writes else contextlib.nullcontext()):
             return _run(a)
     except LedgerError as e:
         print(f"REFUSED: {e}", file=sys.stderr)
+        return 1
+    except (OSError, json.JSONDecodeError, RuntimeError) as e:
+        print(f"REFUSED: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
 
@@ -3431,79 +4772,100 @@ def _run(a) -> int:
         else:
             errs = validate(ledger)
             if not errs:
-                write_render(ledger)
+                write_render(ledger, required=True)
                 print(f"wrote {LEDGER_MD_REL}")
     elif a.cmd == "audit":
         errs = cmd_audit(ledger)
     elif a.cmd == "check":
+        print(f"ledger.py {VERSION}")
         errs = validate(ledger) + render_check(ledger)
         if not errs:
             errs = cmd_audit(ledger)
-    elif a.cmd in ("start", "done", "block"):
-        status = {"start": "in-progress", "done": "done", "block": "blocked"}[a.cmd]
-        extra = {"evidence": getattr(a, "evidence", None), "blockedOn": getattr(a, "on", None),
-                 "heldBy": (getattr(a, "by", None) or "").strip() or None}
-        errs = block_errors(ledger, a.task, a.on, a.until, extra) if a.cmd == "block" else []
-        if a.cmd == "start":
-            errs = errs or start_errors(ledger, a.task, a.by)
-        t = index(ledger)[1].get(a.task)
-        if a.cmd == "done" and t and is_subtask(t):
-            errs = [f"{a.task} is a department subtask: its agent hands it in with `submit`, and the hub's `confirm` "
-                    f"marks it done"]
+    elif a.cmd == "start":
+        errs, lines = cmd_start(ledger, a.task, a.by, current_session(), a.takeover, a.reopen, a.files)
+        if not errs:
+            t = index(ledger)[1][a.task]
+            print(f"{a.task} -> in-progress, {holder_text(t)}; {persist(ledger)} (commit it with the work)")
+            for line in lines:
+                print(line)
+    elif a.cmd in ("done", "block"):
+        status = {"done": "done", "block": "blocked"}[a.cmd]
+        extra = {"evidence": getattr(a, "evidence", None), "blockedOn": getattr(a, "on", None)}
+        if a.cmd == "block":
+            errs = block_errors(ledger, a.task, a.on, a.until, extra)
+        else:
+            errs = done_errors(ledger, a.task, a.evidence)
         errs = errs or set_status(ledger, a.task, status, **extra)
         if not errs:
-            wrote = save(ledger)
-            write_render(ledger)
-            print(f"{a.task} -> {status}; saved {', '.join(wrote) or 'nothing new'} and re-rendered "
-                  f"(commit it with the work)")
+            print(f"{a.task} -> {status}; {persist(ledger)} (commit it with the work)")
+    elif a.cmd == "edit-task":
+        changes: dict = {}
+        if a.title is not None:
+            changes["title"] = a.title
+        if a.wave is not None:
+            changes["wave"] = a.wave
+        if a.depends_on is not None:
+            changes["dependsOn"] = [] if [x.lower() for x in a.depends_on] == ["none"] else a.depends_on
+        if a.files is not None:
+            changes["files"] = [norm(f) for f in a.files]
+        if a.check is not None or a.expect is not None:
+            acc = dict(index(ledger)[1].get(a.task, {}).get("acceptance") or {})
+            acc.update({k: v for k, v in (("check", a.check), ("expect", a.expect)) if v is not None})
+            changes["acceptance"] = acc
+        sid = current_session()
+        errs = cmd_edit_task(ledger, a.task, a.reason, changes, f"session {sid[:8]}" if sid else None)
+        if not errs:
+            print(f"{a.task} edited ({', '.join(changes)}); {persist(ledger)}. Commit it --role Ledger")
     elif a.cmd == "withdraw":
         errs = cmd_withdraw(ledger, a.task, a.reason)
         if not errs:
-            wrote = save(ledger)
-            write_render(ledger)
-            print(f"{a.task} -> withdrawn; saved {', '.join(wrote) or 'nothing new'} and re-rendered (commit it --role Ledger)")
+            print(f"{a.task} -> withdrawn; {persist(ledger)} (commit it --role Ledger)")
     elif a.cmd == "note":
         errs = cmd_note(ledger, a.task, a.text)
         if not errs:
-            wrote = save(ledger)
-            write_render(ledger)
-            print(f"{a.task}: note added; saved {', '.join(wrote)}")
+            print(f"{a.task}: note added; {persist(ledger)}")
     elif a.cmd in ("add-task", "add-decision"):
-        spec = json.loads(Path(a.spec).read_text(encoding="utf-8"))
-        fn = cmd_add_task if a.cmd == "add-task" else cmd_add_decision
-        errs, ident = fn(ledger, a.epic, spec)
+        spec = read_json_file(a.spec, "--from")
+        if a.cmd == "add-task":
+            errs, ident = cmd_add_task(ledger, a.epic, spec, a.same_title_ok)
+        else:
+            errs, ident = cmd_add_decision(ledger, a.epic, spec)
         if not errs:
-            wrote = save(ledger)
-            write_render(ledger)
-            print(f"added {ident}; saved {', '.join(wrote)}. Commit it now: ledger.py commit --role Ledger "
+            print(f"added {ident}; {persist(ledger)}. Commit it now: ledger.py commit --role Ledger "
                   f"--reason \"<why>\" --message <file> {epic_rel(a.epic)} {LEDGER_MD_REL} - with a subject like "
                   f"'Ledger: file {ident} ...', not one starting with the id (that names a task not yet started)")
-    elif a.cmd == "decide":
-        errs = cmd_decide(ledger, a.decision, a.ruling, a.by, a.date)
+    elif a.cmd == "add-plan":
+        errs, made = cmd_add_plan(ledger, read_json_file(a.spec, "--from"), a.same_title_ok)
         if not errs:
-            save(ledger)
-            write_render(ledger)
-            print(f"{a.decision} decided; ledger saved and re-rendered")
+            for where, ident in made:
+                print(f"  {ident:<12} {where}")
+            if a.dry_run:
+                print(f"dry run: the plan passes; it would file the {len(made)} item(s) above. Nothing was written.")
+                return 0
+            print(f"filed {len(made)} item(s); {persist(ledger)}. Commit them now: ledger.py commit --role Ledger "
+                  f"--reason \"<why>\" --message <file> Docs/Ledger/")
+    elif a.cmd == "decide":
+        errs = cmd_decide(ledger, a.decision, a.ruling, a.by, a.date, a.supersede)
+        if not errs:
+            print(f"{a.decision} decided; {persist(ledger)}")
     elif a.cmd == "apply":
         answers = load_answers()
         errs = cmd_apply(ledger, a.decision, answers)
         if not errs:
-            save(ledger)
-            write_render(ledger)
+            said = persist(ledger)
             take_answer(a.decision)
             d = index(ledger)[2][a.decision]
             gated = [t["id"] for t in ledger["tasks"] if a.decision in (t.get("dependsOn") or [])]
             print(f"{a.decision} decided from {OWNER}'s website answer: {d['ruling']}")
-            print(f"  ledger saved and re-rendered; commit {epic_rel(decision_epic(ledger, d))} (--role Ledger). "
+            print(f"  {said}; commit {epic_rel(decision_epic(ledger, d))} (--role Ledger). "
                   f"It gates: {', '.join(gated) or 'no task'}")
     elif a.cmd == "dispatch":
-        errs, out = cmd_dispatch(ledger, a.task, a.by, a.dump, a.restart)
+        errs, out = cmd_dispatch(ledger, a.task, a.by, a.dump, a.restart, a.dirty_ok, current_session())
         if not errs:
-            wrote = save(ledger)
-            write_render(ledger)
+            said = persist(ledger)
             t = index(ledger)[1][a.task]
             print(f"{a.task} dispatched by {t['dispatchedBy']}; covers {', '.join(t['covers']) or 'no other task'}; "
-                  f"saved {', '.join(wrote)}")
+                  f"{said}")
             print(f"Start it now with the Agent tool: subagent_type \"{out['agent']}\", run_in_background "
                   f"{'true' if out['background'] else 'false (the hub waits: the agent may own the editor)'}, "
                   f"and this prompt, word for word:")
@@ -3513,23 +4875,19 @@ def _run(a) -> int:
     elif a.cmd == "submit":
         errs = cmd_submit(ledger, a.task, a.evidence)
         if not errs:
-            save(ledger)
-            write_render(ledger)
-            print(f"{a.task} handed in; it stays in progress until the hub confirms it. Reply to the hub in one line.")
+            print(f"{a.task} handed in; {persist(ledger)}. It stays in progress until the hub confirms it. Reply to "
+                  f"the hub in one line.")
     elif a.cmd == "confirm":
         errs = cmd_confirm(ledger, a.task, a.by, a.evidence, a.new_hub)
         if not errs:
-            save(ledger)
-            write_render(ledger)
+            said = persist(ledger)
             t = index(ledger)[1][a.task]
-            print(f"{a.task} confirmed and done. Commit it now, with a subject starting '{a.task}': ledger.py commit "
-                  f"--message <file> {epic_rel(t['epic'])} (the tool stamps landed)")
+            print(f"{a.task} confirmed and done; {said}. Commit it now, with a subject starting '{a.task}': ledger.py "
+                  f"commit --message <file> {epic_rel(t['epic'])} (the tool stamps landed)")
     elif a.cmd == "finding":
         errs, n = cmd_finding(ledger, a.task, a.severity, a.text, a.evidence)
         if not errs:
-            save(ledger)
-            write_render(ledger)
-            print(f"recorded {a.task}#{n} ({a.severity}); saved")
+            print(f"recorded {a.task}#{n} ({a.severity}); {persist(ledger)}")
     elif a.cmd == "findings":
         rows = all_findings(ledger, a.unrouted, a.severity)
         for t, f in rows:
@@ -3539,11 +4897,9 @@ def _run(a) -> int:
     elif a.cmd == "route":
         errs = cmd_route(ledger, a.finding, a.to, a.reject, a.by, a.new_hub)
         if not errs:
-            save(ledger)
-            write_render(ledger)
-            print(f"{a.finding} routed; saved. Commit the epic file (--role Ledger).")
+            print(f"{a.finding} routed; {persist(ledger)}. Commit the epic file (--role Ledger).")
     elif a.cmd == "commit":
-        msg = Path(a.message).read_text(encoding="utf-8")
+        msg = read_text_file(a.message, "--message")
         return do_commit(ledger, msg, a.role, a.reason, a.agent, a.paths, a.dry_run)
     else:
         errs = [f"unknown command {a.cmd}"]
