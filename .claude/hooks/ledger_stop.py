@@ -15,9 +15,11 @@ Claude Code runs this every time Claude is about to end a reply (registered unde
 Why it exists: a rule written in CLAUDE.md or in memory ("run ledger.py next before ending") kept being skipped.
 A hook runs every time, which a written rule does not. It also does three related checks:
 - Messages the owner sends while Claude works come before ledger work: a message sent mid-reply blocks the ending
-  once with the message quoted. A question is answered at the top, and the work then goes on in the same reply
-  (2026-11-11; until then the reply ended on the answer); an instruction or a report ("do X", "this looks wrong")
-  is acknowledged in one line and done in the same reply. The after-each-step half of this is owner_message_check.py.
+  once with the message quoted. What the owner must read or act on is the reply's last message, whole: they may
+  be shown only a summary of what is written between tool calls (2026-11-11; until then the answer went "at the
+  top" and was lost under the work that followed). A question does not park the work, which goes on in the same
+  reply; an instruction or a report ("do X", "this looks wrong") is acknowledged in one line and done in the same
+  reply. The after-each-step half of this is owner_message_check.py.
 - A reply the owner started is never pushed into ledger work this session had not begun, unless they said to keep
   working while away. A task it was in the middle of goes on once their message is answered or done.
 - A reply that ends by promising work ("I'll fix ...") is blocked once: do it, or name what blocks it. An offer
@@ -275,12 +277,16 @@ def main() -> int:
         # A question is answered and the work goes on; instructions are done in the reply (see the docstring).
         return emit(f"{owner} wrote while you were working:\n"
                     + "\n".join(f"  {quoted(m)}" for m in mid)
-                    + "\nA QUESTION: your final message answers it at the top, in plain words. It does not end the "
-                      "work: the task you were in the middle of goes on in this reply, and the reply ends on the answer "
-                      f"only when the answer needs {owner}'s decision before the work can go on. An INSTRUCTION or a "
-                      "report: one line at the top saying you have it, then do it in this reply before ending. If your "
-                      f"last message already answers every question, nothing {owner} told you to do is left undone or "
-                      "unblocked, and the task you were on is done, running or blocked (say which), end now."
+                    + f"\nWhat {owner} must read or act on (an answer, a command to run, a path, a choice) is the LAST "
+                      "message of this reply, whole and standing alone: they may be shown only a summary of anything "
+                      "written before it. If you gave it earlier in this reply and the reply went on, give it again in "
+                      "full at the end.\n"
+                      "A QUESTION does not end the work: the task you were in the middle of goes on in this reply, a "
+                      "long step in the background, and the reply ends on the answer alone only when the answer needs "
+                      f"{owner}'s decision before the work can go on. An INSTRUCTION or a report: do it in this reply "
+                      "before ending. If your last message already answers every question in full, nothing "
+                      f"{owner} told you to do is left undone or unblocked, and the task you were on is done, running or "
+                      "blocked (say which), end now."
                     + promise_line)
     owner_started = origin == "human" and not start.startswith("This session is being continued")
     commands = ledger_commands(transcript)
@@ -302,7 +308,9 @@ def main() -> int:
         shown.append(f"... and {len(lines) - MAX_LINES} more")
     if owner_started:
         return emit(f"{owner} started this reply: {quoted(start)}\n"
-                    "If that ASKS something, your final message answers it at the top; a task you were in the middle "
+                    "If that ASKS something, the answer is this reply's last message, whole and standing alone: "
+                    f"{owner} may be shown only a summary of anything written before it, so if the reply goes on after "
+                    "you gave it, give it again in full at the end. A task you were in the middle "
                     "of then goes on in this reply, and the reply ends on the answer only when the answer needs "
                     f"{owner}'s decision before the work can go on, or {owner} told you to stop. If it TELLS you to do "
                     "something or reports a problem, doing that comes first: do it in this reply and end only when it "

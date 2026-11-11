@@ -123,17 +123,26 @@ def main() -> int:
     lines = "\n".join("  \"" + (" ".join(t.split())[:400]) + "\"" for _, t in new)
     # Two kinds of message, not one: treating instructions like questions ("answer and end") made Claude reply
     # "I'll do it" and stop.
-    # 2026-11-11: a question no longer ends the reply. It is answered at once, and the work goes on in the same
-    # reply. Until then a question stopped the work until the owner said to resume: a project whose CLAUDE.md said
-    # "answer, then go on" worked on, and one that followed this hook's wording stood still.
+    # 2026-11-11: a question no longer parks the work. Until then it stopped the work until the owner said to
+    # resume: a project whose CLAUDE.md said "answer, then go on" worked on, and one that followed this hook's
+    # wording stood still.
+    # 2026-11-11, later: the answer is the reply's LAST message, not text at the top of the next one. The owner may
+    # be shown only a summary of what is written between tool calls: an answer given "at the top", with the work
+    # going on after it, did not reach them three times in one afternoon. The stop hook keeps the work going
+    # after the answer.
     context = (f"{owner_name().upper()} JUST WROTE TO YOU:\n" + lines + "\n"
-               "If it ASKS something: your next message answers it at the top, in plain words, before any more work - "
-               "make no more tool calls first than the answer itself needs, and do not write \"I'll answer at the "
-               "end\". Then the work goes on in this same reply. End the reply on the answer only when it needs "
-               "their decision before the work can go on.\n"
-               "If it TELLS you to do something or reports a problem: say in one line at the top of your next message "
-               "that you have it, then do it now, in this reply. Never answer an instruction with \"I'll do it\" and stop: "
-               "end only when it is done or running, or name exactly what blocks it (their answer, a build, a missing tool).")
+               "Whatever they must read or act on from you (the answer, a command to run, a path, a choice) goes in "
+               "the LAST message of this reply, whole and standing alone: they may be shown only a summary of anything "
+               "you write between tool calls.\n"
+               "If it ASKS something: get to that last message soon. Make no more tool calls than the answer needs; "
+               "leave a long step running in the background, or stop where nothing is half-changed, and begin no other "
+               "long step first. Then end the reply on the answer. The work is not dropped: it goes on when the "
+               "background step reports or the stop hook continues the reply, and a reply that goes on after an answer "
+               "says again, in its own last message, whatever they still have to read or do.\n"
+               "If it TELLS you to do something or reports a problem: say in one line that you have it, then do it "
+               "now, in this reply, and put what came of it in the reply's last message. Never answer an instruction "
+               "with \"I'll do it\" and stop: end only when it is done or running, or name exactly what blocks it "
+               "(their answer, a build, a missing tool).")
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": context}}))
     return 0
 
