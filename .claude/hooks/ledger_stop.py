@@ -15,10 +15,11 @@ Claude Code runs this every time Claude is about to end a reply (registered unde
 Why it exists: a rule written in CLAUDE.md or in memory ("run ledger.py next before ending") kept being skipped.
 A hook runs every time, which a written rule does not. It also does three related checks:
 - Messages the owner sends while Claude works come before ledger work: a message sent mid-reply blocks the ending
-  once with the message quoted. A question is answered at the top and the reply ends; an instruction or a report
-  ("do X", "this looks wrong") is acknowledged in one line and done in the same reply. The after-each-step half
-  of this is owner_message_check.py.
-- A reply the owner started is never pushed straight into ledger work, unless they said to keep working while away.
+  once with the message quoted. A question is answered at the top, and the work then goes on in the same reply
+  (2026-11-11; until then the reply ended on the answer); an instruction or a report ("do X", "this looks wrong")
+  is acknowledged in one line and done in the same reply. The after-each-step half of this is owner_message_check.py.
+- A reply the owner started is never pushed into ledger work this session had not begun, unless they said to keep
+  working while away. A task it was in the middle of goes on once their message is answered or done.
 - A reply that ends by promising work ("I'll fix ...") is blocked once: do it, or name what blocks it. An offer
   ("If you want, I'll add a test") is not a promise.
 A task id is matched with any prefix (the ledger then checks it), and the owner named in these messages is the one
@@ -271,13 +272,16 @@ def main() -> int:
                     f"do it now, in this reply, or replace the promise with exactly what blocks it ({owner}'s answer, "
                     "the editor, a build)." if promise else "")
     if mid:
-        # Questions end the reply; instructions are done in it (see the docstring).
+        # A question is answered and the work goes on; instructions are done in the reply (see the docstring).
         return emit(f"{owner} wrote while you were working:\n"
                     + "\n".join(f"  {quoted(m)}" for m in mid)
-                    + "\nA QUESTION: answer it at the top of your final message, in plain words, and end the reply "
-                      "there - no more work in it. An INSTRUCTION or a report: one line at the top saying you have it, "
-                      "then do it in this reply before ending. If your last message already answers every question and "
-                      f"nothing {owner} told you to do is left undone or unblocked, end now." + promise_line)
+                    + "\nA QUESTION: your final message answers it at the top, in plain words. It does not end the "
+                      "work: the task you were in the middle of goes on in this reply, and the reply ends on the answer "
+                      f"only when the answer needs {owner}'s decision before the work can go on. An INSTRUCTION or a "
+                      "report: one line at the top saying you have it, then do it in this reply before ending. If your "
+                      f"last message already answers every question, nothing {owner} told you to do is left undone or "
+                      "unblocked, and the task you were on is done, running or blocked (say which), end now."
+                    + promise_line)
     owner_started = origin == "human" and not start.startswith("This session is being continued")
     commands = ledger_commands(transcript)
     if not commands and not mentions_session(session):
@@ -298,10 +302,12 @@ def main() -> int:
         shown.append(f"... and {len(lines) - MAX_LINES} more")
     if owner_started:
         return emit(f"{owner} started this reply: {quoted(start)}\n"
-                    "If that ASKS something, your final message answers it at the top and the reply ends - do not "
-                    "start ledger work. If it TELLS you to do something or reports a problem, doing that comes first: "
-                    "do it in this reply and end only when it is done or running, or name exactly what blocks it. Only "
-                    f"if {owner} told you to work on while away, then start the first of these (`python "
+                    "If that ASKS something, your final message answers it at the top; a task you were in the middle "
+                    "of then goes on in this reply, and the reply ends on the answer only when the answer needs "
+                    f"{owner}'s decision before the work can go on, or {owner} told you to stop. If it TELLS you to do "
+                    "something or reports a problem, doing that comes first: do it in this reply and end only when it "
+                    "is done or running, or name exactly what blocks it. Start a task you had not begun only if "
+                    f"{owner} told you to work on while away. This session's ledger work (`python "
                     "Docs/Ledger/ledger.py next` shows the full picture):\n"
                     + "\n".join(f"  {s}" for s in shown)
                     + "\nThis check blocks once per reply." + promise_line)

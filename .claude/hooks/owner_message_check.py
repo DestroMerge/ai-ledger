@@ -1,5 +1,5 @@
 """PostToolUse hook: when the owner sends a message while Claude is working, tell Claude after its very next tool call to
-stop and answer them.
+answer them.
 
 Claude Code runs this after every tool call (registered under "PostToolUse" in .claude/settings.json). It reads
 the hook's JSON on stdin and, only when there is something to say, prints JSON on stdout whose additionalContext is
@@ -123,10 +123,14 @@ def main() -> int:
     lines = "\n".join("  \"" + (" ".join(t.split())[:400]) + "\"" for _, t in new)
     # Two kinds of message, not one: treating instructions like questions ("answer and end") made Claude reply
     # "I'll do it" and stop.
+    # 2026-11-11: a question no longer ends the reply. It is answered at once, and the work goes on in the same
+    # reply. Until then a question stopped the work until the owner said to resume: a project whose CLAUDE.md said
+    # "answer, then go on" worked on, and one that followed this hook's wording stood still.
     context = (f"{owner_name().upper()} JUST WROTE TO YOU:\n" + lines + "\n"
-               "If it ASKS something: stop the work you are doing; your next message answers it at the top, in plain "
-               "words, and ends the reply - make no more tool calls than the answer itself needs. Do not write "
-               "\"I'll answer at the end\". The work picks up after.\n"
+               "If it ASKS something: your next message answers it at the top, in plain words, before any more work - "
+               "make no more tool calls first than the answer itself needs, and do not write \"I'll answer at the "
+               "end\". Then the work goes on in this same reply. End the reply on the answer only when it needs "
+               "their decision before the work can go on.\n"
                "If it TELLS you to do something or reports a problem: say in one line at the top of your next message "
                "that you have it, then do it now, in this reply. Never answer an instruction with \"I'll do it\" and stop: "
                "end only when it is done or running, or name exactly what blocks it (their answer, a build, a missing tool).")

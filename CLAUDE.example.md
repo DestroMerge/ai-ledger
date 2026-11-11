@@ -63,10 +63,11 @@ python Docs/Ledger/ledger.py check                # the gate: validate, render -
 
 ## Replies
 
-- **A question from me stops your work.** Whether it starts a reply or arrives while you are working, your next
-  reply answers it - first, at the top - and then the reply ends. The work picks up after.
-- **An instruction or a report from me is work, not a question.** "Do X", "this looks wrong": one line at the top
-  saying you have it, then do it in the same reply. Only a question ends the reply.
+- **A question from me is answered, not waited on.** Whether it starts a reply or arrives while you are working, your
+  next reply answers it - first, at the top - and then the work goes on in the same reply. End the reply on the
+  answer only when it needs my decision before the work can go on.
+- **An instruction or a report from me is work.** "Do X", "this looks wrong": one line at the top saying you have
+  it, then do it in the same reply.
 - **Never end a reply promising work.** Either the work is done or running when you stop, or you name exactly what
   blocks it: my answer, a build, a missing tool.
 - **One decision at a time.** `ledger.py next` asks one; a message asks one too.
