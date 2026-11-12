@@ -51,6 +51,22 @@ python Docs/Ledger/ledger.py check                # the gate: validate, render -
 - **Stamp non-obvious changes.** A comment explaining one carries the date and the reason.
 - **Docs describe current state only:** no changelog sections. Proposals live in their own file marked PROPOSED.
 
+## Session length
+
+- **A session costs by its length.** Each step re-reads the conversation so far. `.claude/settings.json` caps the
+  conversation (`autoCompactWindow`, tokens): Claude Code summarises it there.
+- **`python Docs/Ledger/usage.py --latest`** counts where a session's tokens went, and with `--check --cap <tokens>`
+  fails when a step passed the cap.
+- **Write the task's `note` before a summary can take the detail:** at a task boundary, and whenever a stretch of
+  measuring has left numbers that are nowhere but in the conversation.
+
+## Compact instructions
+
+When this conversation is summarised, keep: the ledger tasks this session holds, and what was uncommitted; my last
+instruction, and any question still open to me, in my own words; what was measured and is not yet in a task's note;
+data changed for a test and not put back; jobs still running in the background; and what I am waiting for, with the
+one message that would give it to me.
+
 ## Subagents
 
 - **Default to doing the work inline.** Most work is "verify, then decide", which subagents do worst; handoffs lose
@@ -76,6 +92,9 @@ python Docs/Ledger/ledger.py check                # the gate: validate, render -
 - **Never end a reply promising work.** Either the work is done or running when you stop, or you name exactly what
   blocks it: my answer, a build, a missing tool.
 - **One decision at a time.** `ledger.py next` asks one; a message asks one too.
+- **A reply restarted with nothing new is one or two lines.** When a stop hook or a `/goal` continues a reply and
+  nothing has changed since its last message (no message from me, no step finished), the new last message is the
+  open question and its choices again, not the whole answer a second time.
 
 (The hooks back these up: `owner_message_check.py` tells Claude after its next tool call that you wrote, and
 `ledger_stop.py` blocks a reply that ends with "I'll do it" or skips your message.)

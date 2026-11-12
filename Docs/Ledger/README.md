@@ -15,6 +15,7 @@ come from `ledger_config.json`.
 | `setup_ledger.py` | Writes the config, retags the example ledger to your prefix and owner, and starts the audit at your current commit |
 | `add_epic.py` | Adds one epic with its first task (`ledger.py add-plan` files several at once) |
 | `update_ledger.py` | Brings a project's copy of the tool up to date from an ai-ledger checkout, never touching its data (see "Updating the tool") |
+| `usage.py` | Counts where a Claude Code session's tokens went, from its transcript, and checks a session against a context cap |
 | `review_graph_dump.py` | Unreal projects only: dumps the Blueprint graphs a review covers, for a department agent that has no editor |
 
 The ledger lives in version control, so every session and every machine reads the same state.
@@ -491,10 +492,32 @@ python Docs/Ledger/update_ledger.py --from ../ai-ledger
 ```
 
 It copies the tool's files (`ledger.py`, `ledger_web.py`, `review_graph_dump.py`, `add_epic.py`,
-`update_ledger.py`, this manual, `web/`, and the three hooks), keeps each file's line endings as the project has
+`update_ledger.py`, `usage.py`, this manual, `web/`, and the three hooks), keeps each file's line endings as the project has
 them, never touches the project's data (`ledger_config.json`, `meta.json`, `epics/`, `LEDGER.md`) or its own agents
 and settings, and runs the selftest. `ledger.py version` says which copy a project runs. Raise `VERSION` in
 `ledger.py` with every change to the tool.
+
+## Session length
+
+A session costs by its length: each step re-reads the conversation so far. Counted on one session that had worked a
+project for days (2026-11-12): 4,837 steps, about 530,000 tokens re-read at a typical step, 72% of the cost
+re-reading and 13% new writing. Which model does the work is the smaller lever.
+
+- **Cap the conversation.** `"autoCompactWindow": 300000` in the project's `.claude/settings.json` (100,000 to
+  1,000,000 tokens) has Claude Code summarise the conversation when it reaches that size. `update_ledger.py` never
+  touches a project's settings: set it in each project. A session already running may not take it: start a new one,
+  or type `/compact`.
+- **Count it.** `python Docs/Ledger/usage.py --latest` says where the newest session's tokens went.
+  `--check --cap 300000` exits 1 when a step passed the cap by more than a tenth or the typical step is over the
+  budget, and 2 when there was no step to judge. `--since <time>` counts from a time on, as the transcript writes it.
+- **Say what a summary must keep** in the project's `CLAUDE.md`, under `## Compact instructions`
+  (`CLAUDE.example.md` has one), and write a task's `note` before a summary can take the detail.
+- **A goal the owner alone can meet restarts a waiting session.** `/goal` is the session's own, not a hook of the
+  ledger's: while its condition is unmet the session is started again each time it stops, and each start re-reads
+  the whole conversation. `/goal clear` ends it.
+
+Not built yet: a hook that warns before the cap, one that hands the summary the ledger's state, and one that hands
+that state back after.
 
 ## Waves, and why
 
