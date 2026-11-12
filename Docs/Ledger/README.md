@@ -44,12 +44,13 @@ hooks read it; nothing else in them names a project. `setup_ledger.py` writes it
 | `vcs` | The version control every log, diff and commit goes through: `git` or `diversion`. Each is a class in `ledger.py` (`Git`, `Diversion`); another system needs a class with the same attributes and methods, added to `VCS_BACKENDS` |
 | `unreal` | `true`: a `/Game/` asset path counts as evidence, and a review covering `.uasset` or `.umap` files needs their Blueprint graphs dumped before it is dispatched. `false`: neither, and department prompts name no editor |
 
-Two more keys may be left out:
+Three more keys may be left out:
 
 | Key | What it sets |
 |---|---|
 | `stampZone` | A short time zone label written after every note stamp: `"PT"` makes `2026-10-16 19:45 PT`. For a team whose machines keep different clocks. Empty by default |
 | `editorPython` | Unreal: the command that runs Python inside the open editor (a remote-execution script, say `"python Tools/ue_exec.py -c"`). When set, `dispatch` prints the whole graph-dump command with it |
+| `contextLog` | A path from the repository's root, say `"Saved/Ledger/context.jsonl"`: the context meter's Stop hook adds one line a reply to it, the session and how many tokens its last step read (see "Session length"). Keep it out of version control. Empty by default: no log |
 
 - A key starting with `_` is a note for the reader. A missing key, an unknown key or a bad value stops the tool with
   a message saying which.
@@ -84,7 +85,8 @@ Claude Code records no session; for those the hook still looks for `ledger.py st
 
 The hooks read transcript fields Claude Code does not document (`turnOrigin`, `queue-operation`, `queued_command`).
 If an update renames one, the Stop hook says so once per session; `ledger.py selftest` runs both hooks and the fence
-on transcript lines of the shape they expect.
+on transcript lines of the shape they expect. The context meter (see "Session length") reads one more, the token
+counts of a step (`message.usage`), and says so the same way when they are gone.
 
 ## Daily use
 
@@ -492,7 +494,7 @@ python Docs/Ledger/update_ledger.py --from ../ai-ledger
 ```
 
 It copies the tool's files (`ledger.py`, `ledger_web.py`, `review_graph_dump.py`, `add_epic.py`,
-`update_ledger.py`, `usage.py`, this manual, `web/`, and the three hooks), keeps each file's line endings as the project has
+`update_ledger.py`, `usage.py`, this manual, `web/`, and the four hooks), keeps each file's line endings as the project has
 them, never touches the project's data (`ledger_config.json`, `meta.json`, `epics/`, `LEDGER.md`) or its own agents
 and settings, and runs the selftest. `ledger.py version` says which copy a project runs. Raise `VERSION` in
 `ledger.py` with every change to the tool.
@@ -516,8 +518,35 @@ re-reading and 13% new writing. Which model does the work is the smaller lever.
   ledger's: while its condition is unmet the session is started again each time it stops, and each start re-reads
   the whole conversation. `/goal clear` ends it.
 
-Not built yet: a hook that warns before the cap, one that hands the summary the ledger's state, and one that hands
-that state back after.
+A summary throws detail away, and by itself keeps whatever the session happened to write down.
+`.claude/hooks/context_meter.py` makes the ledger carry it. One file, registered four times:
+
+| Registered as | Run | What it does |
+|---|---|---|
+| `context_meter.py warn` | PostToolUse | The early warning. At 80% of the cap it tells Claude, once, to write each task's note now, and names the tasks the session holds. It is said again only after a summary has taken the conversation back under 60% |
+| `context_meter.py brief` | PreCompact | The summary's brief. Prints, from the ledger, the tasks this session holds, the newest note of the four most lately touched, and the files with uncommitted changes. Claude Code uses a PreCompact hook's output as instructions for the summary |
+| `context_meter.py reentry` | SessionStart | The re-entry. Prints the same after a summary, a clear, a start or a resume, and Claude Code adds it to the conversation. A session that holds no task is shown the six most lately touched in progress and who holds each |
+| `context_meter.py log` | Stop | With `contextLog` set in `ledger_config.json`: one line a reply in that file, the session and its tokens |
+
+The cap it measures against is the first `autoCompactWindow` among the project's `.claude/settings.local.json`, its
+`.claude/settings.json` and the user's own; with none set the warning says nothing. Run with no word after it,
+`python .claude/hooks/context_meter.py` says how large the project's newest session is against the cap. No hook of
+these ever blocks: any failure says nothing and lets the tool result, the summary or the session through.
+
+The block for `.claude/settings.json`, beside the Stop and PostToolUse hooks already there (ai-ledger's own
+`.claude/settings.json` has it whole):
+
+```json
+"PostToolUse": [{ "hooks": [{ "type": "command", "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/context_meter.py\" warn", "timeout": 20 }] }],
+"PreCompact":  [{ "hooks": [{ "type": "command", "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/context_meter.py\" brief", "timeout": 30 }] }],
+"SessionStart": [{ "hooks": [{ "type": "command", "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/context_meter.py\" reentry", "timeout": 30 }] }],
+"Stop":        [{ "hooks": [{ "type": "command", "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/context_meter.py\" log", "timeout": 10 }] }]
+```
+
+What no hook can do: empty the conversation at a task boundary (only `/clear` typed by the owner does; the new
+session then has a new id, and a task the old one held is taken with `start <task> --takeover "<why>"`), and judge
+how good a note is. Claude Code reads its hooks as a session starts: a session already running may need a restart to
+run new ones.
 
 ## Waves, and why
 

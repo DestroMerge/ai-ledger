@@ -117,7 +117,7 @@ from pathlib import Path
 
 # Which copy of the tool this is. Projects copy the tool from the ai-ledger repository (update_ledger.py), so a copy
 # that has fallen behind shows here and in `check`. Raise it with every change to the tool files.
-VERSION = "2026.11.12"
+VERSION = "2026.11.12.1"
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
@@ -229,16 +229,18 @@ class LedgerConflict(LedgerError):
 #   vcs       the version control every log, diff and commit goes through: a key of VCS_BACKENDS
 #   unreal    true for an Unreal project: a /Game/ asset path counts as evidence, and a review covering .uasset or
 #             .umap files needs their Blueprint graphs dumped before it is dispatched
-# Two more may be left out (OPTIONAL_CONFIG gives their defaults):
+# Three more may be left out (OPTIONAL_CONFIG gives their defaults):
 #   stampZone     a short time zone label written after every note stamp ("PT" makes "2026-10-16 19:45 PT"), for a
 #                 team whose machines keep different clocks; empty by default
 #   editorPython  (Unreal) the command that runs Python inside the open editor, such as a remote-execution script;
 #                 when set, `dispatch` prints the whole graph-dump command line with it
+#   contextLog    a path from the repository's root: the context meter's Stop hook adds one line a reply to it, the
+#                 session and how many tokens its last step read (.claude/hooks/context_meter.py); empty: no log
 # Paths stay fixed: the tool lives in Docs/Ledger/ at the repository root, and its working files in Saved/Ledger/.
 
 CONFIG_JSON = HERE / "ledger_config.json"
 CONFIG_KEYS = ("idPrefix", "owner", "vcs", "unreal")
-OPTIONAL_CONFIG = {"stampZone": "", "editorPython": ""}
+OPTIONAL_CONFIG = {"stampZone": "", "editorPython": "", "contextLog": ""}
 RE_PREFIX = re.compile(r"^[A-Z][A-Z0-9]{0,7}$")
 RE_ZONE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+:\-]{0,9})?$")
 # The settings the selftest's fixtures are written in. selftest() runs under these whatever the project's own are.
@@ -466,6 +468,10 @@ def config_errors(cfg) -> list[str]:
         errs.append("stampZone is a short time zone label such as PT or UTC+1, or empty")
     if "editorPython" in cfg and not isinstance(cfg["editorPython"], str):
         errs.append("editorPython is the command that runs Python in the open editor, as text")
+    if "contextLog" in cfg and not (isinstance(cfg["contextLog"], str)
+                                    and not re.match(r"^(?:[A-Za-z]:|[\\/])", cfg["contextLog"])
+                                    and ".." not in re.split(r"[\\/]", cfg["contextLog"])):
+        errs.append("contextLog is a path from the repository's root, such as Saved/Ledger/context.jsonl, or empty")
     if "idPrefix" in cfg and not (isinstance(cfg["idPrefix"], str) and RE_PREFIX.match(cfg["idPrefix"])):
         errs.append(f"idPrefix '{cfg['idPrefix']}' is 1 to 8 capital letters or digits starting with a letter, "
                     f"such as PR")
@@ -3807,6 +3813,7 @@ def _selftest() -> int:
 
     _selftest_review_fixes(expect)
     _selftest_hooks(expect)
+    _selftest_meter(expect)
 
     print("project config: the settings that tie the tool to one project:")
     good = dict(SELFTEST_PROFILE)
@@ -3823,6 +3830,12 @@ def _selftest() -> int:
     expect("a stampZone that is a short label (control)", config_errors({**good, "stampZone": "PT"}), False)
     expect("a stampZone with a space in it", config_errors({**good, "stampZone": "Pacific Time"}), True, "stampZone")
     expect("an editorPython that is not text", config_errors({**good, "editorPython": 3}), True, "editorPython")
+    expect("a contextLog under the repository (control)",
+           config_errors({**good, "contextLog": "Saved/Ledger/context.jsonl"}), False)
+    expect("a contextLog that leaves the repository", config_errors({**good, "contextLog": "../context.jsonl"}), True,
+           "contextLog")
+    expect("a contextLog with a drive in it", config_errors({**good, "contextLog": "C:/context.jsonl"}), True,
+           "contextLog")
     apply_config({**good, "stampZone": "PT", "editorPython": "python run_in_editor.py -c"})
     try:
         ok = (stamp_now().endswith(" PT") and bool(RE_NOTE_STAMP.match(stamp_now())) and days_since(stamp_now()) == 0
@@ -4455,6 +4468,122 @@ def _selftest_hooks(expect) -> None:
                "ledger")
         expect("fence refuses a Write tool into the ledger",
                [fence.refusal("Write", {"file_path": "D:/proj/Docs/Ledger/meta.json"}) or ""], True, "ledger")
+
+
+def _selftest_meter(expect) -> None:
+    """The context meter reads token counts Claude Code does not document (`message.usage`); if an update renamed
+    them, the warning before a summary would go quiet with no error. These run the meter and its three hooks on
+    transcript lines shaped like the ones Claude Code 2.1.3xx writes, and on a ledger of the fixture's."""
+    import tempfile
+    meter = _load_hook("context_meter")
+    if not meter:
+        print("hooks: .claude/hooks/ lacks context_meter.py; not checked")
+        return
+
+    def step(read: int, wrote: int = 0, plain: int = 0, side: bool = False, counts: bool = True) -> dict:
+        message = {"role": "assistant", "content": [{"type": "text", "text": "x"}]}
+        if counts:
+            message["usage"] = {"input_tokens": plain, "cache_read_input_tokens": read,
+                                "cache_creation_input_tokens": wrote, "output_tokens": 50}
+        return {"type": "assistant", "isSidechain": side, "timestamp": "2026-11-12T10:00:00.000Z", "message": message}
+
+    print("hooks: the context meter:")
+    with tempfile.TemporaryDirectory() as tmp:
+        def transcript(*entries) -> Path:
+            p = Path(tmp) / f"t{uuid.uuid4().hex[:6]}.jsonl"
+            p.write_text("".join(json.dumps(e, separators=(",", ":")) + "\n" for e in entries), encoding="utf-8")
+            return p
+
+        got = meter.last_step(transcript(step(100000, 2000, 30), step(200000, 5000, 40)))
+        expect("reads the last step: what it read plain, from cache and wrote to cache, summed (control)",
+               [] if got == (205040, False) else [f"got {got}"], False)
+        got = meter.last_step(transcript(step(200000, 5000, 40), step(900000, side=True), step(0)))
+        expect("skips a subagent's step and a step with every count at 0 (control)",
+               [] if got == (205040, False) else [f"got {got}"], False)
+        got = meter.last_step(transcript(*[step(1, counts=False)] * 3))
+        expect("steps that carry no token counts are flagged (Claude Code renamed the field)",
+               ["flagged"] if got == (None, True) else [], True, "flagged")
+
+        repo, home = Path(tmp) / "proj", Path(tmp) / "home"
+        (repo / ".claude").mkdir(parents=True)
+        (home / ".claude").mkdir(parents=True)
+        expect("with no cap set anywhere there is none (control)",
+               [] if meter.cap(repo, home) is None else [f"got {meter.cap(repo, home)}"], False)
+        (home / ".claude" / "settings.json").write_text('{"autoCompactWindow": 500000}', encoding="utf-8")
+        (repo / ".claude" / "settings.json").write_text('{"autoCompactWindow": 300000, "hooks": {}}', encoding="utf-8")
+        (repo / ".claude" / "settings.local.json").write_text('{"autoCompactWindow": true}', encoding="utf-8")
+        expect("the project's cap comes before the user's, and one that is no number is passed over (control)",
+               [] if meter.cap(repo, home) == 300000 else [f"got {meter.cap(repo, home)}"], False)
+
+        said, warned = [], False
+        for tokens in (100000, 239999, 240000, 280000, 100000, 250000):
+            now, warned = meter.due(tokens, 300000, warned)
+            said.append(now)
+        expect("the warning is due once at 80% of the cap, and again only after a summary (control)",
+               [] if said == [False, False, True, False, False, True] else [str(said)], False)
+
+        sid = f"selftest-{uuid.uuid4().hex[:8]}"
+        f = _fixture()
+        index(f)[1]["PR-E01.01"].update(
+            session=sid, heldBy="session selftest", startedAt="2026-11-12 09:00",
+            notes="2026-11-12 09:10. Found the cause: the cache. 2026-11-12 09:40 PT. Measured 12 ms, was 40. Left: "
+                  "the test.")
+        lines = meter.state(f, sid, ["Source/A.cpp"])
+        ok = (any("holds 1 ledger task " in x for x in lines) and any("PR-E01.01 - a" in x for x in lines)
+              and any("Measured 12 ms" in x and "Found the cause" not in x for x in lines)
+              and any("Source/A.cpp" in x for x in lines))
+        expect("the state names the task a session holds, its newest note alone, and the uncommitted files (control)",
+               [] if ok else lines, False)
+        lines = meter.state(f, "someone-else", None)
+        ok = (any("holds no ledger task" in x for x in lines) and any("could not be asked" in x for x in lines)
+              and any("PR-E01.01" in x and "session selftest" in x for x in lines))
+        expect("a session that holds none is shown what is in progress and who holds it (control)",
+               [] if ok else lines, False)
+        got = meter.last_note("2026-11-12 09:10. " + "x" * 3000 + " the end")
+        ok = got.startswith("... ") and got.endswith("the end") and len(got) == meter.NOTE_CHARS + 4
+        expect("a note over the limit is cut to its end (control)", [] if ok else [got[:60]], False)
+        text = meter.brief(f, sid, [])
+        ok = "Keep in the summary" in text and "PR-E01.01" in text and "No file has uncommitted changes" in text
+        expect("the summary's brief says what to keep and names the held task (control)", [] if ok else [text], False)
+        text = meter.reentry(f, sid, [], "compact")
+        ok = "goes on after a summary" in text and "PR-E01.01" in text and "ledger.py show" in text
+        expect("the re-entry after a summary names the held task and how to read it (control)",
+               [] if ok else [text], False)
+        text = meter.reentry(f, "someone-else", [], "clear")
+        ok = "begins again after a clear" in text and "--takeover" in text
+        expect("the re-entry after a clear says how a task another session held is taken (control)",
+               [] if ok else [text], False)
+
+        try:
+            payload = {"session_id": sid, "transcript_path": str(transcript(step(250000)))}
+            first = meter.hook_warn(payload, 300000, lambda: (f, []))
+            second = meter.hook_warn(payload, 300000, lambda: (f, []))
+            text = ((first or {}).get("hookSpecificOutput") or {}).get("additionalContext", "")
+            ok = "250,000" in text and "ledger.py note" in text and "PR-E01.01" in text and second is None
+            expect("the warning hook speaks once at 250,000 of 300,000 and names the held task (control)",
+                   [] if ok else [f"first {first} second {second}"], False)
+            low = meter.hook_warn({"session_id": sid + "b", "transcript_path": str(transcript(step(100000)))},
+                                  300000, lambda: (f, []))
+            expect("the warning hook says nothing at a third of the cap",
+                   ["quiet"] if low is None else [], True, "quiet")
+            sub = meter.hook_warn({**payload, "session_id": sid + "c", "agent_id": "a1"}, 300000, lambda: (f, []))
+            expect("the warning hook says nothing after a subagent's tool call",
+                   ["quiet"] if sub is None else [], True, "quiet")
+            gone = meter.hook_warn({"session_id": sid + "d",
+                                    "transcript_path": str(transcript(*[step(1, counts=False)] * 3))},
+                                   300000, lambda: (f, []))
+            expect("the warning hook says once that the token counts are gone",
+                   [str((gone or {}).get("systemMessage", ""))], True, "no token counts")
+            log = Path(tmp) / "Saved" / "Ledger" / "context.jsonl"
+            meter.hook_log(payload, log)
+            meter.hook_log(payload, log)
+            rows = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()]
+            ok = len(rows) == 2 and rows[0]["tokens"] == 250000 and rows[0]["session"] == sid
+            expect("the log takes one line a reply, with the session and its tokens (control)",
+                   [] if ok else [str(rows)], False)
+        finally:
+            for tail in ("", "b", "c", "d"):
+                meter.state_file(sid + tail).unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- adding to the ledger

@@ -6,7 +6,7 @@ never the project's data, then runs the selftest.
     python Docs/Ledger/update_ledger.py --from ../ai-ledger --dry-run  only show
 
 Copied (TOOL_FILES): ledger.py, ledger_web.py, review_graph_dump.py, add_epic.py, update_ledger.py, usage.py, README.md (the
-manual), web/, and the three hooks in .claude/hooks/. Never copied: ledger_config.json, meta.json, epics/,
+manual), web/, and the four hooks in .claude/hooks/. Never copied: ledger_config.json, meta.json, epics/,
 LEDGER.md, .claude/agents/ (each project writes its own departments), .claude/settings.json, the launchers.
 
 Each copied file keeps the line endings the project's copy has (CRLF stays CRLF), so a project whose files are CRLF
@@ -30,7 +30,7 @@ TOOL_FILES = ["Docs/Ledger/ledger.py", "Docs/Ledger/ledger_web.py", "Docs/Ledger
               "Docs/Ledger/add_epic.py", "Docs/Ledger/update_ledger.py", "Docs/Ledger/usage.py", "Docs/Ledger/README.md",
               "Docs/Ledger/web/app.js", "Docs/Ledger/web/index.html", "Docs/Ledger/web/style.css",
               ".claude/hooks/ledger_stop.py", ".claude/hooks/owner_message_check.py",
-              ".claude/hooks/department_fence.py"]
+              ".claude/hooks/department_fence.py", ".claude/hooks/context_meter.py"]
 RE_VERSION = re.compile(rb'^VERSION = "([^"]+)"', re.M)
 
 

@@ -42,10 +42,12 @@ person (the "owner") who makes the calls, with Claude doing the work.
 | `Docs/Ledger/add_epic.py` | Adds an epic with its first task (`ledger.py add-plan` files a whole plan from one JSON file) |
 | `Docs/Ledger/update_ledger.py` | Copies a newer version of the tool from this repository into a project that already uses it, leaving its data alone |
 | `.github/workflows/selftest.yml` | Runs the selftest on Windows and Linux on every push |
-| `.claude/settings.json` | Registers the two session hooks |
+| `.claude/settings.json` | Registers the session hooks, and caps the conversation (`autoCompactWindow`) |
 | `.claude/hooks/ledger_stop.py` | Stop hook: no ending a reply while there's ledger work to do or a message unanswered |
 | `.claude/hooks/owner_message_check.py` | PostToolUse hook: tells Claude you wrote while it was working |
 | `.claude/hooks/department_fence.py` | Keeps department agents to their own commands |
+| `.claude/hooks/context_meter.py` | Measures the conversation against its cap: warns before a summary, tells the summary what the ledger says to keep, and hands the ledger's state back after |
+| `Docs/Ledger/usage.py` | Counts where a session's tokens went, and checks a session against the cap |
 | `.claude/agents/` | Two example departments: Code Review, Game Design |
 | `CLAUDE.example.md` | The `CLAUDE.md` sections that go with it: ledger rules, working rules, subagent rules |
 | `Docs/Ledger/review_graph_dump.py` | Unreal Engine projects only: dumps Blueprint graphs so a review agent without the editor can read them |

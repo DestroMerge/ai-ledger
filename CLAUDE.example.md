@@ -58,7 +58,9 @@ python Docs/Ledger/ledger.py check                # the gate: validate, render -
 - **`python Docs/Ledger/usage.py --latest`** counts where a session's tokens went, and with `--check --cap <tokens>`
   fails when a step passed the cap.
 - **Write the task's `note` before a summary can take the detail:** at a task boundary, and whenever a stretch of
-  measuring has left numbers that are nowhere but in the conversation.
+  measuring has left numbers that are nowhere but in the conversation. `.claude/hooks/context_meter.py` says when:
+  at 80% of the cap it tells you once to write the notes; it hands the summary the tasks this session holds and
+  their newest notes, and hands them back after.
 
 ## Compact instructions
 
