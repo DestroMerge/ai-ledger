@@ -73,7 +73,10 @@ Three more keys may be left out:
 **The Stop hook.** `.claude/hooks/ledger_stop.py` runs every time Claude is about to end a reply. In a session that
 has started or dispatched a task, it blocks the ending once when there is work the hub can do without the owner - an
 answer to apply, a subtask to confirm, its own in-progress task or a stale one nobody holds, a ready task - and lists
-up to six. Claude then starts the first, or ends saying in one line why each needs the owner. It never acts in a
+up to six. Claude then starts the first, or ends saying in one line why each needs the owner. Work the session holds
+blocks every reply until it is done; tasks nobody has begun never block a reply the owner started, and are handed to
+any other reply once, not again until the list changes. A reply ended again with nothing new closes in one or two
+lines, not with its answer a second time. It never acts in a
 session that has not worked the ledger, never pushes a session onto a task another session holds, never blocks twice
 in a row, and on any error lets the reply end with a one-line message. It is registered in the checked-in
 `.claude/settings.json`, so every machine runs it.

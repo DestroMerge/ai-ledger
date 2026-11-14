@@ -117,7 +117,7 @@ from pathlib import Path
 
 # Which copy of the tool this is. Projects copy the tool from the ai-ledger repository (update_ledger.py), so a copy
 # that has fallen behind shows here and in `check`. Raise it with every change to the tool files.
-VERSION = "2026.11.12.1"
+VERSION = "2026.11.13"
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent

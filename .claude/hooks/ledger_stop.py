@@ -10,6 +10,11 @@ Claude Code runs this every time Claude is about to end a reply (registered unde
   commands, is never pushed into ledger work.
 - When there is work, it blocks the ending once and hands Claude a short list. `stop_hook_active` is true when
   Claude is already continuing because of this hook; the reply then ends normally, so the hook can never loop.
+- Work the session holds (an answer to apply, a subtask to confirm, its own task in progress) blocks every reply
+  until it is done. Tasks nobody has begun do not block a reply the owner started, and are handed to any other reply
+  once: not again until the list changes. A session whose own task waits on the owner then ends its replies freely.
+- A block never asks for the same answer twice: a reply ended again with nothing new closes in one or two lines.
+  (2026-11-13: until then every block asked for the answer "again in full", and the owner got each answer twice.)
 - Any failure lets the reply end and tells the owner why in one line. It never traps a session.
 
 Why it exists: a rule written in CLAUDE.md or in memory ("run ledger.py next before ending") kept being skipped.
@@ -244,6 +249,33 @@ def warn_once(session: str, text: str) -> str | None:
     return text
 
 
+def begun_work(lines: list[str]) -> list[str]:
+    """The lines of hub_work that are work this session already holds or that waits on the hub (an answer to apply, a
+    subtask to confirm, a task in progress): everything but the tasks nobody has begun."""
+    return [s for s in lines if not s.startswith(("READY", "DISPATCH"))]
+
+
+def offered_before(session: str, lines: list[str]) -> bool:
+    """True when this session was already handed exactly this list of work it has not begun, and so has already said
+    why it is not starting it (a small state file in the temp folder). A new list is remembered and gives False."""
+    mark = Path(tempfile.gettempdir()) / f"claude_ledger_stop_offered_{session or 'unknown'}"
+    text = "\n".join(lines)
+    try:
+        if mark.is_file() and mark.read_text(encoding="utf-8") == text:
+            return True
+        mark.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+    return False
+
+
+# Said in every block: a reply that is only being ended again says nothing twice. Until 2026-11-13 each block asked for
+# the answer "again in full at the end", and with a block on almost every reply the owner was sent every answer twice.
+SAID_ALREADY = ("If your last message already gave it in full and nothing has changed since (no new message, no step "
+                "finished), do not write it again: end with one or two lines, the open question and its choices or "
+                "what is running.")
+
+
 def main() -> int:
     payload = json.loads(sys.stdin.buffer.read().decode("utf-8") or "{}")
     if payload.get("stop_hook_active"):
@@ -279,8 +311,8 @@ def main() -> int:
                     + "\n".join(f"  {quoted(m)}" for m in mid)
                     + f"\nWhat {owner} must read or act on (an answer, a command to run, a path, a choice) is the LAST "
                       "message of this reply, whole and standing alone: they may be shown only a summary of anything "
-                      "written before it. If you gave it earlier in this reply and the reply went on, give it again in "
-                      "full at the end.\n"
+                      "written before it. If you gave it earlier in this reply and went on to other work after it, give "
+                      f"it again in full at the end. {SAID_ALREADY}\n"
                       "A QUESTION does not end the work: the task you were in the middle of goes on in this reply, a "
                       "long step in the background, and the reply ends on the answer alone only when the answer needs "
                       f"{owner}'s decision before the work can go on. An INSTRUCTION or a report: do it in this reply "
@@ -303,14 +335,22 @@ def main() -> int:
     lines = hub_work(L, led, started) if (done or mine) else []
     if not lines:
         return emit(promise_line.strip() or None)
+    if not begun_work(lines):
+        # Only tasks nobody has begun. A reply the owner started is never pushed onto them (they asked for something
+        # else); any other reply is handed the list once, and not again until the list changes. Until 2026-11-13 this
+        # blocked every reply of a session whose own task was waiting on the owner, and each block drew a second
+        # copy of the answer.
+        if owner_started or offered_before(session, lines):
+            return emit(promise_line.strip() or None)
     shown = lines[:MAX_LINES]
     if len(lines) > MAX_LINES:
         shown.append(f"... and {len(lines) - MAX_LINES} more")
     if owner_started:
         return emit(f"{owner} started this reply: {quoted(start)}\n"
                     "If that ASKS something, the answer is this reply's last message, whole and standing alone: "
-                    f"{owner} may be shown only a summary of anything written before it, so if the reply goes on after "
-                    "you gave it, give it again in full at the end. A task you were in the middle "
+                    f"{owner} may be shown only a summary of anything written before it, so if the reply went on to "
+                    f"other work after you gave it, give it again in full at the end. {SAID_ALREADY} A task you were "
+                    "in the middle "
                     "of then goes on in this reply, and the reply ends on the answer only when the answer needs "
                     f"{owner}'s decision before the work can go on, or {owner} told you to stop. If it TELLS you to do "
                     "something or reports a problem, doing that comes first: do it in this reply and end only when it "
@@ -322,8 +362,9 @@ def main() -> int:
     return emit(f"Ledger check: this session works the ledger, and it has work you can do without {owner}:\n"
                 + "\n".join(f"  {s}" for s in shown)
                 + "\nStart the first one now; `python Docs/Ledger/ledger.py next` shows the full picture. End the reply "
-                  f"only if {owner} told you to stop, or each of these needs {owner}: then say which in one line. This "
-                  "check blocks once per reply." + promise_line)
+                  f"only if {owner} told you to stop, or each of these needs {owner}: then say which in one line, and "
+                  "do not write your last answer again. This check blocks once per reply, and a list of tasks nobody "
+                  "has begun is handed to a session once." + promise_line)
 
 
 if __name__ == "__main__":
